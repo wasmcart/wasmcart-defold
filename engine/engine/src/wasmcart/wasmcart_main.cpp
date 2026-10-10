@@ -576,6 +576,8 @@ __attribute__((weak, used, export_name("wc_alloc")))
 void* wc_alloc(size_t size, size_t align)
 {
     if (align < sizeof(void*)) align = sizeof(void*);
+    if (align & (align - 1)) return nullptr;         // not a power of two
+    if (size > (size_t)-1 - align) return nullptr;   // rounding up would wrap
     // aligned_alloc wants a size that is a multiple of the alignment
     size = size ? (size + align - 1) & ~(align - 1) : align;
     return aligned_alloc(align, size);
