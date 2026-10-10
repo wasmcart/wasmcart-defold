@@ -22,6 +22,7 @@
 // without RunLoop in the picture at all.
 
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include "engine_version.h"
@@ -565,6 +566,25 @@ void wc_render(void)
         g_EngineAlive = false;
         WC_LOG("defold-wasmcart: engine exited");
     }
+}
+
+// wc_alloc / wc_free (wasmcart 0.32, mirrors wasmcart.h): the allocator the
+// host writes into the cart through (glGetString/glMapBufferRange results,
+// WebGPU glue payloads, text and network data). Weak like the header's, over
+// aligned_alloc/free so memory the WebGPU glue releases with free() is valid.
+__attribute__((weak, used, export_name("wc_alloc")))
+void* wc_alloc(size_t size, size_t align)
+{
+    if (align < sizeof(void*)) align = sizeof(void*);
+    // aligned_alloc wants a size that is a multiple of the alignment
+    size = size ? (size + align - 1) & ~(align - 1) : align;
+    return aligned_alloc(align, size);
+}
+
+__attribute__((weak, used, export_name("wc_free")))
+void wc_free(void* ptr)
+{
+    free(ptr);
 }
 
 } // extern "C"
