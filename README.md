@@ -164,20 +164,42 @@ How the WebGPU cart differs from Defold's browser WebGPU build:
 The device is whatever the host created. Defold's sprite, label, GUI, particle
 and physics content renders without validation errors on a
 compatibility-feature-level device as well as a core one; texture arrays, cube
-maps, compute and MSAA have not been exercised on either.
+maps, compute and MSAA all work on the wasmcart WebGPU host (wasmcart's own
+compute test cart, three.c's cube maps and array textures, cartwheel's 4x MSAA
+gate), but Defold's adapter has not yet been run with content that uses them.
+
+## Native extensions: the SDK
+
+A game whose dependencies include C++ (an `ext.manifest` with sources, such as
+extension-spine) needs an engine with that code linked in. The SDK makes one
+without building Defold: the engine's static libraries, the two cart entry
+objects, the headers, the recorded link lines, and `link.mjs`, which compiles a
+project's extensions the way Defold's Extender does and relinks both cart
+engines in seconds. A project with no native code gets the stock engines back
+byte for byte.
+
+```bash
+node sdk/make-sdk.mjs --tar                     # after building the engine
+node tmp/wasmcart-defold-sdk/link.mjs mygame    # -> mygame/build/wasmcart-engine/
+```
+
+CI publishes `wasmcart-defold-sdk.tar.gz` beside the engines. Details, and what
+a browser-only extension needs to run in a cart: [sdk/README.md](sdk/README.md).
 
 ## How this repo is organised
 
 The full Defold tree is **vendored** at upstream commit `540123b`, not forked.
 The first commit is that tree verbatim, so `git diff <base>..HEAD` is an exact
-account of what the port changes: 33 files, ~2800 lines.
+account of what the port changes: about 60 files, ~4000 lines (the SDK
+tooling under `sdk/` included).
 
 Vendored wholesale because the build needs nearly all of it. `install_ext` does
 **not** download - it extracts tarballs that must already be in `packages/` -
 so `packages/` (368 MB), `external/` (155 MB) and `com.dynamo.cr/` (bob) all
 have to be present. Dropping the editor alone saves 79 MB of 744 MB.
 
-The port itself is eight new files plus edits threaded through existing ones:
+The port itself is these new files plus edits threaded through existing ones,
+including Defold's WebGPU adapter (`engine/graphics/src/webgpu/`):
 
 | File | Replaces |
 | --- | --- |
@@ -191,9 +213,11 @@ The port itself is eight new files plus edits threaded through existing ones:
 
 ## ABI
 
-wasmcart ABI v3. The cart exports `wc_get_info`, `wc_init` and `wc_render`, and
-declares GLES3 as its GPU API. Pads, pointer, keyboard, audio ring, save block
-and the host clock are all wired.
+wasmcart ABI v4. The cart exports `wc_get_info`, `wc_init`, `wc_render` and the
+`wc_alloc`/`wc_free` pair the host writes cart memory through. The GL cart
+declares GLES3 as its GPU API and the WebGPU cart declares WebGPU
+(`gpu_api = 2`). Pads, pointer, keyboard, audio ring, save block and the host
+clock are all wired.
 
 `wc_get_info` is idempotent: a host may call it again after `wc_init` to pick up
 the resolved resolution, and some do.

@@ -1,7 +1,8 @@
 name: wasmcart runtime
 
-# Builds the cart runtime and publishes the engine wasm. That is the only
-# artifact this project produces: the content compiler (bob) and the builtins
+# Builds the cart runtime and publishes the two engine wasms (GL and WebGPU)
+# and the SDK that relinks them with native extensions. Those are the only
+# artifacts this project produces: the content compiler (bob) and the builtins
 # tree are upstream Defold's, so consumers take them from Defold's own archive.
 # wasmcart-defold-examples downloads this engine rather than rebuilding it,
 # which keeps that repo's CI to a couple of minutes.
@@ -19,6 +20,7 @@ on:
       - 'share/**'
       - 'build_tools/**'
       - 'scripts/build.py'
+      - 'sdk/**'
   workflow_dispatch:
   release:
     types: [published]
@@ -130,6 +132,20 @@ jobs:
           } > tmp/emscripten_config
           cat tmp/emscripten_config
 
+      # The WebGPU cart links Dawn's emdawnwebgpu port, and must use the same
+      # release the wasmcart host's WebGPU glue was generated from (wasmcart's
+      # scripts/wgpu/emdawnwebgpu.json), so it is pinned and checksummed here.
+      - name: Fetch the emdawnwebgpu release
+        run: |
+          set -euo pipefail
+          REL=v20261002.154047
+          SUM=6b14532b85c7f4d51154b6eeb6bd3fcf7735ad5c7cfd698d83985dd21a1c15c2
+          curl -fsSL -o "$RUNNER_TEMP/emdawnwebgpu.zip" \
+            "https://github.com/google/dawn/releases/download/$REL/emdawnwebgpu_pkg-$REL.zip"
+          echo "$SUM  $RUNNER_TEMP/emdawnwebgpu.zip" | sha256sum -c
+          unzip -q "$RUNNER_TEMP/emdawnwebgpu.zip" -d "$RUNNER_TEMP"
+          echo "DEFOLD_EMDAWNWEBGPU_PORT=$RUNNER_TEMP/emdawnwebgpu_pkg/emdawnwebgpu.port.py" >> "$GITHUB_ENV"
+
       - name: Install external packages
         run: ./scripts/build.py --platform=wasm-web install_ext
 
@@ -167,23 +183,57 @@ jobs:
       # build.py has exited 0 after a fatal compile error before now, leaving a
       # stale wasm in place. Assert the artifact exists and is plausibly sized
       # rather than trusting the exit code.
-      - name: Verify the engine was actually produced
+      - name: Verify the engines were actually produced
         run: |
-          W=tmp/dynamo_home/bin/wasm-web/dmengine_wasmcart.wasm
-          test -f "$W" || { echo "no engine at $W"; exit 1; }
-          SZ=$(stat -c%s "$W")
-          echo "engine: $SZ bytes"
-          test "$SZ" -gt 1000000 || { echo "engine is implausibly small"; exit 1; }
+          for W in tmp/dynamo_home/bin/wasm-web/dmengine_wasmcart.wasm tmp/dynamo_home/bin/wasm-web/dmengine_wasmcart_webgpu.wasm; do
+            test -f "$W" || { echo "no engine at $W"; exit 1; }
+            SZ=$(stat -c%s "$W")
+            echo "$W: $SZ bytes"
+            test "$SZ" -gt 1000000 || { echo "$W is implausibly small"; exit 1; }
+          done
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+
+      # The SDK is read from this build's own ninja graph, so it relinks
+      # exactly what build.py just linked.
+      - name: Make the SDK
+        run: node sdk/make-sdk.mjs --tar
+
+      # Prove the SDK before publishing it: relink with a one-function C++
+      # extension, run the cart, require the extension's answer, and require
+      # the same project to fail on an engine relinked without it. GL only: the
+      # runner has Mesa's software GL but no WebGPU device. The WebGPU engine
+      # is the same relink with a different entry object and graphics library.
+      - name: Test the SDK
+        env:
+          LIBGL_ALWAYS_SOFTWARE: '1'
+          EGL_PLATFORM: surfaceless
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends \
+            libegl1 libgles2 libglvnd0 libgl1-mesa-dri libglx-mesa0 libgbm1
+          # bob from the Defold release this engine is (1.14.0), not whatever
+          # is newest: newer content can be unreadable to an older engine.
+          BOB_SHA=a81dbb0478e8b73931dc2d671563204f6ac0ef82
+          curl -fL --max-time 900 -o "$RUNNER_TEMP/bob.jar" \
+            "https://d.defold.com/archive/stable/$BOB_SHA/bob/bob.jar"
+          npm install --prefix "$RUNNER_TEMP/wc" --no-save --no-audit --no-fund wasmcart
+          node sdk/test/run.mjs --variant gl --bob "$RUNNER_TEMP/bob.jar" \
+            --wasmcart "$RUNNER_TEMP/wc/node_modules/wasmcart" --emsdk "$HOME/emsdk"
 
       # Only the engine is published: bob.jar and builtins are upstream
       # Defold's, unmodified here, and consumers get them from Defold's own
       # archive instead of a copy redistributed under this project's name.
-      - name: Stage the engine
+      - name: Stage the engines and the SDK
         run: |
           mkdir -p dist
           cp tmp/dynamo_home/bin/wasm-web/dmengine_wasmcart.wasm dist/
-          (cd dist && sha256sum dmengine_wasmcart.wasm > SHA256SUMS)
-          du -sh dist
+          cp tmp/dynamo_home/bin/wasm-web/dmengine_wasmcart_webgpu.wasm dist/
+          cp tmp/wasmcart-defold-sdk.tar.gz dist/
+          (cd dist && sha256sum dmengine_wasmcart.wasm dmengine_wasmcart_webgpu.wasm wasmcart-defold-sdk.tar.gz > SHA256SUMS)
+          du -sh dist/*
 
       - uses: actions/upload-artifact@v7
         with:
@@ -209,6 +259,7 @@ jobs:
             exit 0
           fi
           gh release upload "${GITHUB_REF_NAME}" \
-            dist/dmengine_wasmcart.wasm dist/SHA256SUMS
+            dist/dmengine_wasmcart.wasm dist/dmengine_wasmcart_webgpu.wasm \
+            dist/wasmcart-defold-sdk.tar.gz dist/SHA256SUMS
         env:
           GH_TOKEN: ${{ github.token }}

@@ -1,0 +1,15 @@
+[project]
+title = sdkprobe
+version = 1.0
+
+[bootstrap]
+main_collection = /main/main.collectionc
+render = /builtins/render/default.renderc
+
+[display]
+width = 320
+height = 240
+
+[input]
+game_binding = /builtins/input/all.input_bindingc
+gamepads = /builtins/input/default.gamepadsc

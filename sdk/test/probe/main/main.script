@@ -1,0 +1,12 @@
+-- Calls into the sdkprobe native extension, which only exists in an engine
+-- relinked by the SDK. Prints one PASS or FAIL line that the test reads.
+function init(self)
+	if not sdkprobe then
+		print("sdkprobe: FAIL the sdkprobe module is missing (engine not relinked with the extension)")
+		return
+	end
+	local sum = sdkprobe.add(2, 3)
+	local platform = sdkprobe.platform()
+	local ok = sum == 5 and platform == "wasmcart"
+	print(string.format("sdkprobe: %s add=%s platform=%s", ok and "PASS" or "FAIL", tostring(sum), tostring(platform)))
+end
