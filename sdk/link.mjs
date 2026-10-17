@@ -6,7 +6,9 @@
 //   --out DIR        where the engines go (default <project>/build/wasmcart-engine)
 //   --variant V      gl, webgpu or all (default all the SDK has)
 //   --ext DIR        an extra extension folder (repeatable)
-//   --skip-ext NAME  leave out a native extension the project has (repeatable)
+//   --skip-ext NAME  leave out a native extension the project has (repeatable).
+//                    With --ext, this replaces a project's extension with
+//                    another of the same name: --skip-ext never drops an --ext.
 //   --emsdk DIR      the emsdk to compile with (default $EMSDK, else em++ on PATH)
 //
 // Extensions are found the way bob finds them: every folder with an
@@ -149,7 +151,7 @@ for (const dir of extDirs) {
   const m = parseYaml(fs.readFileSync(path.join(dir, 'ext.manifest'), 'utf8'));
   const name = m.name;
   if (!name) fail(`${dir}/ext.manifest has no name`);
-  if (skipExts.has(name)) { console.log(`link: skipping extension ${name} (--skip-ext)`); continue; }
+  if (skipExts.has(name) && !extraExts.includes(dir)) { console.log(`link: skipping extension ${name} (--skip-ext)`); continue; }
   const ctx = { defines: [], flags: [], linkFlags: [], libs: [], symbols: [], excludeSymbols: [], excludeLibs: [], includes: [] };
   for (const k of PLATFORM_KEYS) {
     const c = m.platforms?.[k]?.context;
@@ -160,6 +162,13 @@ for (const dir of extDirs) {
   const libDirs = ['wasm-web', 'web'].map(p => path.join(dir, 'lib', p)).filter(p => fs.existsSync(p));
   const archives = libDirs.flatMap(d => listFiles(d, /\.a$/));
   const jsLibs = libDirs.flatMap(d => listFiles(d, /\.js$/));
+  // A manifest with no sources and no prebuilt libraries carries only content
+  // or editor plugins (defold-pbr does): nothing to link, and its name is not
+  // a symbol anything defines.
+  if (!sources.length && !archives.length) {
+    if (jsLibs.length) console.warn(`link: ${name}: only JavaScript (a cart has no JS), skipped: ${jsLibs.map(p => path.basename(p)).join(', ')}`);
+    continue;
+  }
   exts.push({ name, dir, ctx, sources, archives, libDirs, jsLibs });
 }
 

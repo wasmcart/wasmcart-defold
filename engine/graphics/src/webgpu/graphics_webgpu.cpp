@@ -460,6 +460,31 @@ static bool WebGPURealizeTexture(WebGPUTexture* texture, WGPUTextureFormat forma
             return false;
         }
 
+#if defined(WGPU_TEXTURE_BINDING_VIEW_DIMENSION_INIT)
+        // In compatibility mode a texture is bound with one view dimension,
+        // named when it is created; left out, a 2D texture with six layers is
+        // bound as a 2D array, so a cube map fails validation at every bind
+        // group ("Dimension (Cube) ... must match textureBindingViewDimension
+        // (e2DArray)") and nothing that samples it draws. A core device takes
+        // the same descriptor and ignores the dimension.
+        WGPUTextureBindingViewDimension binding_view_dimension = WGPU_TEXTURE_BINDING_VIEW_DIMENSION_INIT;
+        switch (texture->m_Base.m_Type)
+        {
+        case TEXTURE_TYPE_CUBE_MAP:
+        case TEXTURE_TYPE_TEXTURE_CUBE:
+            binding_view_dimension.textureBindingViewDimension = WGPUTextureViewDimension_Cube;
+            desc.nextInChain = &binding_view_dimension.chain;
+            break;
+        case TEXTURE_TYPE_2D_ARRAY:
+        case TEXTURE_TYPE_TEXTURE_2D_ARRAY:
+            binding_view_dimension.textureBindingViewDimension = WGPUTextureViewDimension_2DArray;
+            desc.nextInChain = &binding_view_dimension.chain;
+            break;
+        default:
+            break;
+        }
+#endif
+
         texture->m_Texture = wgpuDeviceCreateTexture(g_WebGPUContext->m_Device, &desc);
         if (!texture->m_Texture)
             return false;
