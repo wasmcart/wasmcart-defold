@@ -134,14 +134,11 @@ namespace dmGameSystem
                         render_resource_metas[i].m_Type);
                 }
             }
-            else
-            {
-                for (uint32_t i = 0; i < prototype->m_RenderResources.Size(); ++i)
-                {
-                    if (prototype->m_RenderResources[i])
-                        dmResource::Release(factory, prototype->m_RenderResources[i]);
-                }
-            }
+            // On failure the resources acquired so far stay in
+            // m_RenderResources: the caller's ReleaseResources() releases them,
+            // and releasing them here as well released each one twice, which
+            // asserted in dmResource::Release before the failed resource's own
+            // error could be logged.
         }
         dmDDF::FreeMessage(prototype_desc);
         return result;
