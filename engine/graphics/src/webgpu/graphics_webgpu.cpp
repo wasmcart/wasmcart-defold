@@ -909,6 +909,105 @@ static inline uint16_t WebGPUGetVertexAttributeCount(const VertexDeclaration::St
     }
 }
 
+// Vertex inputs the program declares that no enabled vertex declaration
+// supplies. GL gives a disabled attribute its current value, (0,0,0,1) by
+// default, so a material may declare an input a mesh does not have (a light
+// map's texcoord1 on a mesh with one UV set). WebGPU refuses such a pipeline
+// ("Vertex attribute slot N used in ... is not present in the VertexState"),
+// and nothing using it draws. Each missing location is fed (0,0,0,1) from a
+// constant buffer instead (array stride 0: every vertex reads the same value).
+// Writes up to max attributes to out (when given) and returns the count.
+static const uint32_t DEFAULT_VERTEX_ATTRIBUTE_OFFSET_FLOAT = 0;
+static const uint32_t DEFAULT_VERTEX_ATTRIBUTE_OFFSET_SINT  = 16;
+static const uint32_t DEFAULT_VERTEX_ATTRIBUTE_OFFSET_UINT  = 32;
+static const uint32_t DEFAULT_VERTEX_ATTRIBUTE_BUFFER_SIZE  = 48;
+
+static uint32_t WebGPUGetMissingVertexInputs(WebGPUContext* context, WGPUVertexAttribute* out, uint32_t max)
+{
+    if (!context->m_CurrentProgram)
+        return 0;
+    const dmArray<ShaderResourceBinding>& inputs = context->m_CurrentProgram->m_BaseProgram.m_ShaderMeta.m_Inputs;
+    uint32_t count = 0;
+    for (uint32_t j = 0; j < inputs.Size(); ++j)
+    {
+        const ShaderResourceBinding& input = inputs[j];
+        if (!(input.m_StageFlags & SHADER_STAGE_FLAG_VERTEX))
+            continue;
+        ShaderDesc::ShaderDataType type = input.m_Type.m_UseTypeIndex ? ShaderDesc::SHADER_TYPE_VEC4 : input.m_Type.m_ShaderType;
+        uint32_t locations = type == ShaderDesc::SHADER_TYPE_MAT4 ? 4 : (type == ShaderDesc::SHADER_TYPE_MAT3 ? 3 : (type == ShaderDesc::SHADER_TYPE_MAT2 ? 2 : 1));
+        for (uint32_t l = 0; l < locations; ++l)
+        {
+            const uint32_t location = input.m_Binding + l;
+            bool supplied = false;
+            for (int i = 0; i < MAX_VERTEX_BUFFERS && !supplied; ++i)
+            {
+                VertexDeclaration* declaration = context->m_CurrentVertexDeclaration[i];
+                if (!context->m_CurrentVertexBuffers[i] || !declaration || !declaration->m_StreamCount)
+                    continue;
+                for (uint16_t s = 0; s < declaration->m_StreamCount; ++s)
+                {
+                    const VertexDeclaration::Stream& stream = declaration->m_Streams[s];
+                    if (location >= stream.m_Location && location < stream.m_Location + WebGPUGetVertexAttributeCount(stream))
+                    {
+                        supplied = true;
+                        break;
+                    }
+                }
+            }
+            if (supplied)
+                continue;
+            if (out && count < max)
+            {
+                out[count] = {};
+                out[count].shaderLocation = location;
+                if (type == ShaderDesc::SHADER_TYPE_INT)
+                {
+                    out[count].format = WGPUVertexFormat_Sint32x4;
+                    out[count].offset = DEFAULT_VERTEX_ATTRIBUTE_OFFSET_SINT;
+                }
+                else if (type == ShaderDesc::SHADER_TYPE_UINT || type == ShaderDesc::SHADER_TYPE_UVEC2 ||
+                         type == ShaderDesc::SHADER_TYPE_UVEC3 || type == ShaderDesc::SHADER_TYPE_UVEC4)
+                {
+                    out[count].format = WGPUVertexFormat_Uint32x4;
+                    out[count].offset = DEFAULT_VERTEX_ATTRIBUTE_OFFSET_UINT;
+                }
+                else
+                {
+                    out[count].format = WGPUVertexFormat_Float32x4;
+                    out[count].offset = DEFAULT_VERTEX_ATTRIBUTE_OFFSET_FLOAT;
+                }
+            }
+            ++count;
+        }
+    }
+    return count;
+}
+
+static WGPUBuffer WebGPUGetDefaultVertexAttributeBuffer(WebGPUContext* context)
+{
+    if (!context->m_DefaultVertexAttributeBuffer)
+    {
+#if defined(DM_GRAPHICS_WEBGPU2)
+        WGPUBufferDescriptor desc = WGPU_BUFFER_DESCRIPTOR_INIT;
+#else
+        WGPUBufferDescriptor desc = {};
+#endif
+        desc.usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst;
+        desc.size  = DEFAULT_VERTEX_ATTRIBUTE_BUFFER_SIZE;
+        context->m_DefaultVertexAttributeBuffer = wgpuDeviceCreateBuffer(context->m_Device, &desc);
+
+        uint8_t data[DEFAULT_VERTEX_ATTRIBUTE_BUFFER_SIZE] = {};
+        const float one_f = 1.0f;
+        const int32_t one_i = 1;
+        const uint32_t one_u = 1;
+        memcpy(data + DEFAULT_VERTEX_ATTRIBUTE_OFFSET_FLOAT + 12, &one_f, 4);
+        memcpy(data + DEFAULT_VERTEX_ATTRIBUTE_OFFSET_SINT + 12, &one_i, 4);
+        memcpy(data + DEFAULT_VERTEX_ATTRIBUTE_OFFSET_UINT + 12, &one_u, 4);
+        wgpuQueueWriteBuffer(context->m_Queue, context->m_DefaultVertexAttributeBuffer, 0, data, sizeof(data));
+    }
+    return context->m_DefaultVertexAttributeBuffer;
+}
+
 static WGPUComputePipeline WebGPUGetOrCreateComputePipeline(WebGPUContext* context)
 {
     HashState64 pipeline_hash_state;
@@ -1058,6 +1157,18 @@ static WGPURenderPipeline WebGPUGetOrCreateRenderPipeline(WebGPUContext* context
             }
             ++desc.vertex.bufferCount;
         }
+    }
+    // Inputs no bound buffer supplies read a constant (see WebGPUGetMissingVertexInputs).
+    WGPUVertexAttribute missingAttributes[MAX_VERTEX_BUFFERS * 4];
+    const uint32_t missing_count = WebGPUGetMissingVertexInputs(context, missingAttributes, DM_ARRAY_SIZE(missingAttributes));
+    if (missing_count && desc.vertex.bufferCount < MAX_VERTEX_BUFFERS)
+    {
+        vertexBuffers[desc.vertex.bufferCount]                = {};
+        vertexBuffers[desc.vertex.bufferCount].arrayStride    = 0;
+        vertexBuffers[desc.vertex.bufferCount].stepMode       = WGPUVertexStepMode_Vertex;
+        vertexBuffers[desc.vertex.bufferCount].attributes     = missingAttributes;
+        vertexBuffers[desc.vertex.bufferCount].attributeCount = dmMath::Min(missing_count, (uint32_t)DM_ARRAY_SIZE(missingAttributes));
+        ++desc.vertex.bufferCount;
     }
     if (desc.vertex.bufferCount)
         desc.vertex.buffers = vertexBuffers;
@@ -1783,6 +1894,11 @@ static void WebGPUDestroyContext(WebGPUContext* context)
     {
         WebGPUDestroyTexture(context->m_DefaultStorageImage2D);
         context->m_DefaultStorageImage2D = NULL;
+    }
+    if (context->m_DefaultVertexAttributeBuffer)
+    {
+        wgpuBufferRelease(context->m_DefaultVertexAttributeBuffer);
+        context->m_DefaultVertexAttributeBuffer = NULL;
     }
     while (!context->m_CurrentScratchUniforms.m_Allocs.Empty())
     {
@@ -3080,6 +3196,25 @@ static void WebGPUSetupRenderPipeline(WebGPUContext* context, WebGPUBuffer* inde
             vertex_buffer->m_LastRenderPass = context->m_RenderPasses;
         }
         ++binding;
+    }
+    // The constant source for inputs no bound buffer supplies, in the slot
+    // after the real buffers, as the pipeline laid it out.
+    if (WebGPUGetMissingVertexInputs(context, NULL, 0))
+    {
+        uint32_t binding = 0;
+        for (int slot = 0; slot < MAX_VERTEX_BUFFERS; ++slot)
+        {
+            VertexDeclaration* declaration = context->m_CurrentVertexDeclaration[slot];
+            if (context->m_CurrentVertexBuffers[slot] && declaration && declaration->m_StreamCount)
+                ++binding;
+        }
+        WGPUBuffer constant = WebGPUGetDefaultVertexAttributeBuffer(context);
+        if (binding < MAX_VERTEX_BUFFERS && context->m_CurrentRenderPass.m_VertexBuffers[binding] != constant)
+        {
+            wgpuRenderPassEncoderSetVertexBuffer(context->m_CurrentRenderPass.m_Encoder, binding, constant, 0, DEFAULT_VERTEX_ATTRIBUTE_BUFFER_SIZE);
+            context->m_CurrentRenderPass.m_VertexBuffers[binding]       = constant;
+            context->m_CurrentRenderPass.m_VertexBufferOffsets[binding] = 0;
+        }
     }
 
     // Set the bind groups

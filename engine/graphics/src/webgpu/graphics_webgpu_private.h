@@ -216,6 +216,8 @@ namespace dmGraphics
         WebGPUTexture*                     m_DefaultTextureCubeMap;
         WebGPUTexture*                     m_DefaultTexture2D32UI;
         WebGPUTexture*                     m_DefaultStorageImage2D;
+        // Constant (0,0,0,1) source for vertex inputs no bound buffer supplies.
+        WGPUBuffer                         m_DefaultVertexAttributeBuffer;
         WebGPURenderTarget*                m_MainRenderTarget;
 
         WGPUInstance                       m_Instance;
