@@ -23,6 +23,7 @@
 // skipped with a warning, and any import it would have satisfied is reported
 // after the link, by name, rather than failing later at load.
 import { execFileSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -111,6 +112,21 @@ function parseYaml(text) {
 }
 
 // --- extension discovery -----------------------------------------------------
+/**
+ * The dependency zips bob resolved for a project. .internal/lib keeps every
+ * zip ever downloaded there, a stale one included when a dependency is
+ * re-pinned, and dependencies.json names the current set: each entry's zip is
+ * named by the SHA-1 of its url.
+ */
+function dependencyZips(libDir) {
+  if (!fs.existsSync(libDir)) return [];
+  const zips = fs.readdirSync(libDir).filter(f => f.endsWith('.zip'));
+  const manifest = path.join(libDir, 'dependencies.json');
+  if (!fs.existsSync(manifest)) return zips;
+  const wanted = JSON.parse(fs.readFileSync(manifest, 'utf8')).map(e => crypto.createHash('sha1').update(e.url).digest('hex'));
+  return zips.filter(z => wanted.some(h => z.startsWith(h)));
+}
+
 const SKIP_DIRS = new Set(['build', '.internal', '.git', 'node_modules', '.editor_settings']);
 function findManifests(dir, out = []) {
   for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -125,8 +141,8 @@ process.on('exit', () => fs.rmSync(work, { recursive: true, force: true }));
 
 const extDirs = [...findManifests(project), ...extraExts];
 const libZips = path.join(project, '.internal/lib');
-if (fs.existsSync(libZips)) {
-  for (const z of fs.readdirSync(libZips).filter(f => f.endsWith('.zip'))) {
+{
+  for (const z of dependencyZips(libZips)) {
     const dst = path.join(work, 'deps', z.replace(/\.zip$/, ''));
     fs.mkdirSync(dst, { recursive: true });
     execFileSync('unzip', ['-q', '-o', path.join(libZips, z), '-d', dst]);

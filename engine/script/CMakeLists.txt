@@ -59,8 +59,15 @@ add_custom_target(script_package_proto_files
 file(GLOB SCRIPT_TOP_SOURCES CONFIGURE_DEPENDS "${SCRIPT_SRC_DIR}/*.cpp")
 set(SCRIPT_SOURCES ${SCRIPT_TOP_SOURCES} ${SCRIPT_PROTO_CC})
 
-if(TARGET_PLATFORM MATCHES "web$")
+# A cart is a web build with no browser: script_html5_js.cpp's html5.run and
+# friends would call into JavaScript the host does not have, so the cart gets
+# the stub that registers no `html5` module, and a game's `if html5 then`
+# reads it as what it is, not a browser.
+if(TARGET_PLATFORM MATCHES "web$" AND NOT DEFOLD_WASMCART)
   list(FILTER SCRIPT_SOURCES EXCLUDE REGEX "/script_html5\\.cpp$")
+  list(FILTER SCRIPT_SOURCES EXCLUDE REGEX "/http_service\\.cpp$")
+elseif(TARGET_PLATFORM MATCHES "web$")
+  list(FILTER SCRIPT_SOURCES EXCLUDE REGEX "/script_html5_js\\.cpp$")
   list(FILTER SCRIPT_SOURCES EXCLUDE REGEX "/http_service\\.cpp$")
 else()
   list(FILTER SCRIPT_SOURCES EXCLUDE REGEX "/script_html5_js\\.cpp$")
