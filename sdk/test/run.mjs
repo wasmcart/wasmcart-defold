@@ -63,7 +63,9 @@ async function runCart(wasm, label, hostOpts) {
   try {
     await host.load(cart, hostOpts);
     if (hostOpts.wgpu !== false && !host.usesWgpu) return '(the host ran the dual cart on GL, not WebGPU)';
-    for (let f = 0; f < 10; f++) host.runFrame([]);
+    // Yield between frames as a real host does: a dual cart on WebGPU asks
+    // for its own device, which arrives on the event loop between frames.
+    for (let f = 0; f < 20; f++) { host.runFrame([]); await new Promise(r => setImmediate(r)); }
   } finally {
     host.destroy?.();
     Object.assign(console, orig);

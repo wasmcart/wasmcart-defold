@@ -157,12 +157,14 @@ static bool              g_EngineAlive = false;
 #if defined(DM_WASMCART_DUAL)
 // On WebGPU the engine starts once the cart has its own device with
 // float32-filterable/blendable, or knows it cannot have one
-// (graphics_webgpu.cpp), usually two frames in. A host that has not answered
-// in WASMCART_DEVICE_WAIT_FRAMES gets the engine on the host's device.
+// (graphics_webgpu.cpp): two frames in on the Node host, about four in
+// Chromium. The device arrives between frames, so an embedder stepping frames
+// in a tight loop never sees it: after WASMCART_DEVICE_WAIT_FRAMES the engine
+// starts on the host's device instead (R32F targets then sample unfiltered).
 extern "C" bool WebGPUWasmcartDeviceReady(bool give_up);
 static bool     g_EngineWaitsForDevice = false;
 static uint32_t g_DeviceWaitFrames     = 0;
-#define WASMCART_DEVICE_WAIT_FRAMES 300
+#define WASMCART_DEVICE_WAIT_FRAMES 8
 #endif
 
 #ifdef __wasm__
