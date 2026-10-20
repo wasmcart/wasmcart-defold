@@ -154,6 +154,17 @@ static dmPlatform::WasmcartInputState g_InputState;
 static dmEngine::HEngine g_Engine      = 0;
 static bool              g_EngineAlive = false;
 
+#if defined(DM_WASMCART_DUAL)
+// On WebGPU the engine starts once the cart has its own device with
+// float32-filterable/blendable, or knows it cannot have one
+// (graphics_webgpu.cpp), usually two frames in. A host that has not answered
+// in WASMCART_DEVICE_WAIT_FRAMES gets the engine on the host's device.
+extern "C" bool WebGPUWasmcartDeviceReady(bool give_up);
+static bool     g_EngineWaitsForDevice = false;
+static uint32_t g_DeviceWaitFrames     = 0;
+#define WASMCART_DEVICE_WAIT_FRAMES 300
+#endif
+
 #ifdef __wasm__
 __attribute__((import_module("env"), import_name("wc_log")))
 extern "C" void wc_log(const char* ptr, unsigned int len);
@@ -244,6 +255,8 @@ wc_info_t* wc_get_info(void)
     return &g_Info;
 }
 
+static void CreateEngine();
+
 __attribute__((export_name("wc_init")))
 void wc_init(void)
 {
@@ -275,6 +288,18 @@ void wc_init(void)
     dmExportedSymbols();
     dmEngineInitialize();
 
+#if defined(DM_WASMCART_DUAL)
+    if ((g_HostInfo.flags & WC_HOST_FLAG_GPU_WGPU) && !WebGPUWasmcartDeviceReady(false))
+    {
+        g_EngineWaitsForDevice = true;
+        return;
+    }
+#endif
+    CreateEngine();
+}
+
+static void CreateEngine()
+{
     // The engine reads game.projectc out of the mounted archive, so there is
     // no command line to pass through. A dual cart names the adapter the host
     // selected: the host binds the other API's imports to functions that
@@ -319,6 +344,13 @@ void wc_render(void)
 {
     if (!g_EngineAlive)
     {
+#if defined(DM_WASMCART_DUAL)
+        if (g_EngineWaitsForDevice && WebGPUWasmcartDeviceReady(++g_DeviceWaitFrames >= WASMCART_DEVICE_WAIT_FRAMES))
+        {
+            g_EngineWaitsForDevice = false;
+            CreateEngine();
+        }
+#endif
         return;
     }
 

@@ -95,6 +95,23 @@ namespace dmGraphics
         WGPUBindGroup          m_BindGroups[MAX_SET_COUNT];
         WGPUPipelineLayout     m_PipelineLayout;
 
+        // Layouts by the mask of texture units whose bound texture cannot be
+        // filtered (a depth texture, or a 32-bit float one without
+        // float32-filterable): those bind as unfilterable float with a
+        // non-filtering sampler. m_BindGroupLayouts/m_PipelineLayout are the
+        // variant for m_UnfilterableMask (see WebGPUSelectLayoutVariant).
+        struct LayoutVariant
+        {
+            uint32_t            m_Mask;
+            WGPUBindGroupLayout m_BindGroupLayouts[MAX_SET_COUNT];
+            WGPUPipelineLayout  m_PipelineLayout;
+        };
+        static const uint32_t    MAX_LAYOUT_VARIANTS = 8;
+        WGPUBindGroupLayoutEntry m_LayoutEntries[MAX_SET_COUNT][MAX_BINDINGS_PER_SET_COUNT];
+        LayoutVariant            m_LayoutVariants[MAX_LAYOUT_VARIANTS];
+        uint32_t                 m_LayoutVariantCount;
+        uint32_t                 m_UnfilterableMask;
+
         uint64_t               m_Hash;
         uint8_t*               m_UniformData;
 
@@ -129,6 +146,8 @@ namespace dmGraphics
         // shader binding and a separate all-aspects view as an attachment.
         WGPUTextureView         m_RenderTargetView;
         WGPUSampler             m_Sampler;
+        // m_Sampler with nearest filtering, for a binding that cannot filter.
+        WGPUSampler             m_SamplerNearest;
         WGPUTextureFormat       m_Format;
 #if defined(DM_GRAPHICS_WEBGPU2)
         WGPUTextureUsage        m_UsageFlags;
@@ -250,7 +269,10 @@ namespace dmGraphics
 
         uint32_t            m_ViewportChanged : 1;
         uint32_t            m_ApplyRenderTargetLoadOps : 1;
+        float               m_PolygonOffsetFactor;
+        float               m_PolygonOffsetUnits;
         uint32_t            m_HasValidationError : 1;
+        uint32_t            m_Float32Filterable : 1;
         uint32_t            m_InitComplete : 1;
         uint32_t            m_OpaqueSurface : 1;
         uint32_t            m_InitializeOpaqueSurface : 1;

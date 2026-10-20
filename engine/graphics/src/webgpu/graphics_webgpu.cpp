@@ -54,11 +54,13 @@ using namespace dmVMath;
 // wasmcart WebGPU cart. Differences from the browser build, all forced by the
 // cart ABI rather than chosen:
 //   - The HOST owns the device. emscripten_webgpu_get_device() hands it over
-//     synchronously, so there is no adapter/device request and no wait. A
-//     cart has no Asyncify, and wgpuInstanceWaitAny with a timeout is not
-//     available, so the browser path (request + WaitAny) cannot run here.
+//     synchronously. A cart has no Asyncify, and wgpuInstanceWaitAny with a
+//     timeout is not available, so the browser path (request + WaitAny)
+//     cannot run inside graphics init. The one exception is a device with
+//     float32-filterable, which the shim waits for across frames before it
+//     creates the engine (WebGPUWasmcartDeviceReady).
 //   - There is therefore no WGPUAdapter. Feature queries go to the device.
-//   - The device is imported, so an uncaptured-error callback cannot be
+//   - The host's device is imported, so an uncaptured-error callback cannot be
 //     attached to it. Errors are collected with an error scope that is kept
 //     open across each frame and popped after the frame's submit; the result
 //     arrives on the host's event loop between frames.
@@ -161,6 +163,123 @@ static WebGPUContext* g_WebGPUContext = NULL;
 
 DM_REGISTER_GRAPHICS_ADAPTER(GraphicsAdapterWebGPU, &g_webgpu_adapter, WebGPUIsSupported, WebGPURegisterFunctionTable, WebGPUGetContext, ADAPTER_FAMILY_PRIORITY_WEBGPU);
 
+#if defined(DM_GRAPHICS_WEBGPU_WASMCART)
+// The host's device has no optional features (wasmcart docs/webgpu.md,
+// "Limits and features"), but Defold binds every texture as filterable float,
+// and an R32F render target only samples that way with float32-filterable;
+// blending into one needs float32-blendable (the browser build requests the
+// first in instanceRequestAdapterCallback). Without them a game that samples an
+// R32F target draws nothing. So the cart asks for its own device with
+// whichever of the two the adapter has, as the wasmcart spec allows, before
+// the engine starts. The request completes between frames: the shim calls
+// WebGPUWasmcartDeviceReady() each frame and creates the engine once it
+// returns true. Without the features, or when the request fails, the engine
+// runs on the host's device as before (an R32F target then samples without
+// filtering, see WebGPUSelectLayoutVariant, and does not blend, see
+// WebGPUBlendableFormat).
+enum WasmcartDeviceState { WASMCART_DEVICE_NONE, WASMCART_DEVICE_PENDING, WASMCART_DEVICE_DONE };
+static WasmcartDeviceState g_WasmcartDeviceState = WASMCART_DEVICE_NONE;
+static WGPUDevice          g_WasmcartDevice      = 0;
+
+static void WebGPUWasmcartDeviceError(WGPUDevice const*, WGPUErrorType type, WGPUStringView message, void*, void*)
+{
+    if (g_WebGPUContext)
+        g_WebGPUContext->m_HasValidationError = 1;
+    dmLogError("WebGPU uncaptured error (%d): %.*s", (int)type, (int)message.length, message.data);
+}
+
+static void WebGPUWasmcartDeviceLost(WGPUDevice const*, WGPUDeviceLostReason reason, WGPUStringView message, void*, void*)
+{
+    if (reason != WGPUDeviceLostReason_Destroyed && reason != WGPUDeviceLostReason_CallbackCancelled)
+        dmLogError("WebGPU: device lost (%d): %.*s", (int)reason, (int)message.length, message.data);
+}
+
+static void WebGPUWasmcartOnDevice(WGPURequestDeviceStatus status, WGPUDevice device, WGPUStringView message, void*, void*)
+{
+    if (g_WasmcartDeviceState == WASMCART_DEVICE_DONE)
+    {
+        // Arrived after the shim stopped waiting: the engine is on the host's device.
+        if (device)
+            wgpuDeviceDestroy(device);
+        return;
+    }
+    if (status == WGPURequestDeviceStatus_Success && device)
+        g_WasmcartDevice = device;
+    else
+        dmLogWarning("WebGPU: no float32-filterable/blendable device (%.*s); using the host's", (int)message.length, message.data);
+    g_WasmcartDeviceState = WASMCART_DEVICE_DONE;
+}
+
+static void WebGPUWasmcartOnAdapter(WGPURequestAdapterStatus status, WGPUAdapter adapter, WGPUStringView, void*, void*)
+{
+    static WGPUFeatureName features[2];
+    uint32_t feature_count = 0;
+    if (status == WGPURequestAdapterStatus_Success && adapter)
+    {
+        if (wgpuAdapterHasFeature(adapter, WGPUFeatureName_Float32Filterable))
+            features[feature_count++] = WGPUFeatureName_Float32Filterable;
+        if (wgpuAdapterHasFeature(adapter, WGPUFeatureName_Float32Blendable))
+            features[feature_count++] = WGPUFeatureName_Float32Blendable;
+    }
+    if (!feature_count)
+    {
+        g_WasmcartDeviceState = WASMCART_DEVICE_DONE;
+        return;
+    }
+    WGPUDeviceDescriptor desc                  = WGPU_DEVICE_DESCRIPTOR_INIT;
+    desc.requiredFeatureCount                  = feature_count;
+    desc.requiredFeatures                      = features;
+    desc.uncapturedErrorCallbackInfo.callback  = WebGPUWasmcartDeviceError;
+    desc.deviceLostCallbackInfo.mode           = WGPUCallbackMode_AllowSpontaneous;
+    desc.deviceLostCallbackInfo.callback       = WebGPUWasmcartDeviceLost;
+    WGPURequestDeviceCallbackInfo info         = WGPU_REQUEST_DEVICE_CALLBACK_INFO_INIT;
+    info.mode                                  = WGPUCallbackMode_AllowSpontaneous;
+    info.callback                              = WebGPUWasmcartOnDevice;
+    wgpuAdapterRequestDevice(adapter, &desc, info);
+}
+
+// give_up: stop waiting and use the host's device (a host that never answers).
+extern "C" bool WebGPUWasmcartDeviceReady(bool give_up)
+{
+    if (g_WasmcartDeviceState == WASMCART_DEVICE_NONE)
+    {
+        g_WasmcartDeviceState = WASMCART_DEVICE_PENDING;
+        WGPUInstance instance = wgpuCreateInstance(nullptr);
+        if (!instance)
+        {
+            g_WasmcartDeviceState = WASMCART_DEVICE_DONE;
+            return true;
+        }
+        WGPURequestAdapterCallbackInfo info = WGPU_REQUEST_ADAPTER_CALLBACK_INFO_INIT;
+        info.mode                           = WGPUCallbackMode_AllowSpontaneous;
+        info.callback                       = WebGPUWasmcartOnAdapter;
+        wgpuInstanceRequestAdapter(instance, NULL, info);
+    }
+    if (give_up && g_WasmcartDeviceState != WASMCART_DEVICE_DONE)
+    {
+        dmLogWarning("WebGPU: no answer to the float32-filterable/blendable device request; using the host's device");
+        g_WasmcartDeviceState = WASMCART_DEVICE_DONE;
+    }
+    return g_WasmcartDeviceState == WASMCART_DEVICE_DONE;
+}
+#endif
+
+static bool WebGPUHasFeature(WebGPUContext* context, WGPUFeatureName feature);
+
+// WebGPU rejects a pipeline that blends into a 32-bit float target unless the
+// device has float32-blendable (GL blends there). Without it the target is
+// written unblended: the pipeline is valid and the rest of the frame draws.
+static bool WebGPUBlendableFormat(WebGPUContext* context, WGPUTextureFormat format)
+{
+#if defined(DM_GRAPHICS_WEBGPU2)
+    if (format != WGPUTextureFormat_R32Float && format != WGPUTextureFormat_RG32Float && format != WGPUTextureFormat_RGBA32Float)
+        return true;
+    return WebGPUHasFeature(context, WGPUFeatureName_Float32Blendable);
+#else
+    return true; // the WebGPU v1 headers predate float32-blendable
+#endif
+}
+
 static WGPUSampler WebGPUGetOrCreateSampler(WebGPUContext* context, TextureFilter minfilter, TextureFilter magfilter, TextureWrap uwrap, TextureWrap vwrap, TextureWrap wwrap, float max_anisotropy)
 {
     HashState64 sampler_hash_state;
@@ -184,7 +303,6 @@ static WGPUSampler WebGPUGetOrCreateSampler(WebGPUContext* context, TextureFilte
     desc.lodMinClamp           = 0;
     desc.lodMaxClamp           = 32;
 
-    desc.maxAnisotropy = uint16_t(max_anisotropy);
     desc.addressModeU  = g_webgpu_address_mode[uwrap];
     desc.addressModeV  = g_webgpu_address_mode[vwrap];
     desc.addressModeW  = g_webgpu_address_mode[wwrap];
@@ -208,11 +326,11 @@ static WGPUSampler WebGPUGetOrCreateSampler(WebGPUContext* context, TextureFilte
     switch (minfilter)
     {
         case TEXTURE_FILTER_NEAREST:
-            desc.magFilter   = WGPUFilterMode_Nearest;
+            desc.minFilter   = WGPUFilterMode_Nearest;
             desc.lodMaxClamp = 0.25f;
             break;
         case TEXTURE_FILTER_LINEAR:
-            desc.magFilter   = WGPUFilterMode_Linear;
+            desc.minFilter   = WGPUFilterMode_Linear;
             desc.lodMaxClamp = 0.25f;
             break;
         case TEXTURE_FILTER_NEAREST_MIPMAP_NEAREST:
@@ -234,6 +352,12 @@ static WGPUSampler WebGPUGetOrCreateSampler(WebGPUContext* context, TextureFilte
         default:
             assert(false);
     }
+
+    // WebGPU rejects a sampler whose maxAnisotropy is below 1 (a material
+    // sampler with max_anisotropy 0, which GL and Vulkan treat as "off"), and
+    // one above 1 unless every filter is linear.
+    const bool all_linear = desc.minFilter == WGPUFilterMode_Linear && desc.magFilter == WGPUFilterMode_Linear && desc.mipmapFilter == WGPUMipmapFilterMode_Linear;
+    desc.maxAnisotropy = (all_linear && max_anisotropy > 1.0f) ? uint16_t(dmMath::Min(max_anisotropy, 16.0f)) : 1;
 
     WGPUSampler sampler = wgpuDeviceCreateSampler(context->m_Device, &desc);
     if (context->m_SamplerCache.Full())
@@ -292,6 +416,7 @@ static void WebGPUSetTextureParamsInternal(WebGPUTexture* texture, TextureFilter
 {
     TRACE_CALL;
     texture->m_Sampler = WebGPUGetOrCreateSampler(g_WebGPUContext, minfilter, magfilter, uwrap, vwrap, wwrap, max_anisotropy);
+    texture->m_SamplerNearest = WebGPUGetOrCreateSampler(g_WebGPUContext, TEXTURE_FILTER_NEAREST, TEXTURE_FILTER_NEAREST, uwrap, vwrap, wwrap, 1.0f);
 }
 
 static WGPUTextureFormat WebGPUFormatFromTextureFormat(TextureFormat format)
@@ -604,12 +729,18 @@ static void WebGPUSetTextureInternal(WebGPUTexture* texture, const TextureParams
          ((is_array_texture || is_cube_texture) && texture->m_Base.m_PageCount != texture_layer_count) ||
          (params.m_MipMap == 0 && (current_storage_width != new_storage_width || current_storage_height != new_storage_height)));
 
-    if (texture->m_Texture && (texture->m_Base.m_Format != params.m_Format || texture_dimensions_changed))
+    // RGB data is stored as RGBA (WebGPU has no RGB8 format, see the transcode
+    // below), so RGB arriving for an RGBA texture is the same format: the
+    // texture's next mip level, or a sub-update. Treating it as a change
+    // recreated the texture for every mip level after the first, leaving
+    // mipmapped RGB textures (JPEGs) empty.
+    const bool format_changed = texture->m_Base.m_Format != params.m_Format &&
+        !(params.m_Format == TEXTURE_FORMAT_RGB && texture->m_Base.m_Format == TEXTURE_FORMAT_RGBA);
+    if (texture->m_Texture && (format_changed || texture_dimensions_changed))
     { //must recreate texture
         if (params.m_SubUpdate)
         {
-            if (params.m_Format != TEXTURE_FORMAT_RGB || texture->m_Base.m_Format != TEXTURE_FORMAT_RGBA) // this will transcode
-                dmLogError("Cannot handle subdata format changing %d vs %d", texture->m_Base.m_Format, params.m_Format);
+            dmLogError("Cannot handle subdata format changing %d vs %d", texture->m_Base.m_Format, params.m_Format);
         }
         else
         {
@@ -1013,6 +1144,7 @@ static WGPUComputePipeline WebGPUGetOrCreateComputePipeline(WebGPUContext* conte
     HashState64 pipeline_hash_state;
     dmHashInit64(&pipeline_hash_state, false);
     dmHashUpdateBuffer64(&pipeline_hash_state, &context->m_CurrentProgram->m_Hash, sizeof(context->m_CurrentProgram->m_Hash));
+    dmHashUpdateBuffer64(&pipeline_hash_state, &context->m_CurrentProgram->m_UnfilterableMask, sizeof(context->m_CurrentProgram->m_UnfilterableMask));
 
     const uint64_t pipeline_hash = dmHashFinal64(&pipeline_hash_state);
     if (WGPUComputePipeline* cached_pipeline = context->m_ComputePipelineCache.Get(pipeline_hash))
@@ -1050,7 +1182,13 @@ static WGPURenderPipeline WebGPUGetOrCreateRenderPipeline(WebGPUContext* context
     HashState64 pipeline_hash_state;
     dmHashInit64(&pipeline_hash_state, false);
     dmHashUpdateBuffer64(&pipeline_hash_state, &context->m_CurrentProgram->m_Hash, sizeof(context->m_CurrentProgram->m_Hash));
+    dmHashUpdateBuffer64(&pipeline_hash_state, &context->m_CurrentProgram->m_UnfilterableMask, sizeof(context->m_CurrentProgram->m_UnfilterableMask));
     dmHashUpdateBuffer64(&pipeline_hash_state, &context->m_CurrentPipelineState, sizeof(context->m_CurrentPipelineState));
+    if (context->m_CurrentPipelineState.m_PolygonOffsetFillEnabled)
+    {
+        dmHashUpdateBuffer64(&pipeline_hash_state, &context->m_PolygonOffsetFactor, sizeof(context->m_PolygonOffsetFactor));
+        dmHashUpdateBuffer64(&pipeline_hash_state, &context->m_PolygonOffsetUnits, sizeof(context->m_PolygonOffsetUnits));
+    }
     dmHashUpdateBuffer64(&pipeline_hash_state, &context->m_CurrentRenderPass.m_Target, sizeof(context->m_CurrentRenderPass.m_Target));
     dmHashUpdateBuffer64(&pipeline_hash_state, &use_flipped_vertex_entry_point, sizeof(use_flipped_vertex_entry_point));
     dmHashUpdateBuffer64(&pipeline_hash_state, &context->m_CurrentRenderPass.m_Target->m_Multisample, sizeof(context->m_CurrentRenderPass.m_Target->m_Multisample));
@@ -1220,16 +1358,23 @@ static WGPURenderPipeline WebGPUGetOrCreateRenderPipeline(WebGPUContext* context
             depthstencil_desc.depthWriteEnabled = context->m_CurrentPipelineState.m_WriteDepth && context->m_CurrentPipelineState.m_DepthTestEnabled;
 #endif
             depthstencil_desc.depthCompare      = context->m_CurrentPipelineState.m_DepthTestEnabled ? g_webgpu_compare_funcs[context->m_CurrentPipelineState.m_DepthTestFunc] : WGPUCompareFunction_Always;
+            // glPolygonOffset(factor, units): the slope term and the constant
+            // one in units of the smallest resolvable depth difference.
+            if (context->m_CurrentPipelineState.m_PolygonOffsetFillEnabled)
+            {
+                depthstencil_desc.depthBias           = (int32_t)context->m_PolygonOffsetUnits;
+                depthstencil_desc.depthBiasSlopeScale = context->m_PolygonOffsetFactor;
+            }
             if (context->m_CurrentPipelineState.m_StencilEnabled)
             {
                 depthstencil_desc.stencilFront.compare     = g_webgpu_compare_funcs[context->m_CurrentPipelineState.m_StencilFrontTestFunc];
                 depthstencil_desc.stencilFront.failOp      = g_webgpu_stencil_ops[context->m_CurrentPipelineState.m_StencilFrontOpFail];
                 depthstencil_desc.stencilFront.depthFailOp = g_webgpu_stencil_ops[context->m_CurrentPipelineState.m_StencilFrontOpDepthFail];
                 depthstencil_desc.stencilFront.passOp      = g_webgpu_stencil_ops[context->m_CurrentPipelineState.m_StencilFrontOpPass];
-                depthstencil_desc.stencilBack.compare      = g_webgpu_compare_funcs[context->m_CurrentPipelineState.m_StencilFrontTestFunc];
+                depthstencil_desc.stencilBack.compare      = g_webgpu_compare_funcs[context->m_CurrentPipelineState.m_StencilBackTestFunc];
                 depthstencil_desc.stencilBack.failOp       = g_webgpu_stencil_ops[context->m_CurrentPipelineState.m_StencilBackOpFail];
                 depthstencil_desc.stencilBack.depthFailOp  = g_webgpu_stencil_ops[context->m_CurrentPipelineState.m_StencilBackOpDepthFail];
-                depthstencil_desc.stencilBack.passOp       = g_webgpu_stencil_ops[context->m_CurrentPipelineState.m_StencilFrontOpPass];
+                depthstencil_desc.stencilBack.passOp       = g_webgpu_stencil_ops[context->m_CurrentPipelineState.m_StencilBackOpPass];
             }
             else
             {
@@ -1309,7 +1454,7 @@ static WGPURenderPipeline WebGPUGetOrCreateRenderPipeline(WebGPUContext* context
 #endif
             WebGPUTexture* texture = GetAssetFromContainer<WebGPUTexture>(g_WebGPUContext->m_BaseContext.m_AssetHandleContainer, context->m_CurrentRenderPass.m_Target->m_TextureColor[a]);
             targets_desc[a].format = texture->m_Format;
-            if (context->m_CurrentPipelineState.m_BlendEnabled)
+            if (context->m_CurrentPipelineState.m_BlendEnabled && WebGPUBlendableFormat(context, texture->m_Format))
                 targets_desc[a].blend = &blend_state;
             targets_desc[a].writeMask = write_mask;
         }
@@ -1650,9 +1795,10 @@ static bool InitializeWebGPUContext(WebGPUContext* context, const ContextParams&
 
 #if defined(DM_GRAPHICS_WEBGPU_WASMCART)
     {
-        // The host's device, synchronously. Then the same setup the browser
-        // path runs from its request-device callback.
-        WGPUDevice device = emscripten_webgpu_get_device();
+        // The cart's own float32-filterable device if it got one (see
+        // WebGPUWasmcartDeviceReady), else the host's, synchronously. Then the
+        // same setup the browser path runs from its request-device callback.
+        WGPUDevice device = g_WasmcartDevice ? g_WasmcartDevice : emscripten_webgpu_get_device();
         if (!device)
         {
             dmLogError("WebGPU: the host provided no device");
@@ -1695,6 +1841,7 @@ static bool InitializeWebGPUContext(WebGPUContext* context, const ContextParams&
         !context->m_Surface || context->m_Format == WGPUTextureFormat_Undefined)
         return false;
 
+    context->m_Float32Filterable = WebGPUHasFeature(context, WGPUFeatureName_Float32Filterable);
     context->m_SamplerCache.SetCapacity(32, 64);
     context->m_BindGroupCache.SetCapacity(32, 64);
     context->m_RenderPipelineCache.SetCapacity(32, 64);
@@ -2311,10 +2458,19 @@ static void WebGPUBeginRenderPass(WebGPUContext* context, uint32_t clear_flags, 
 
     if (context->m_ViewportChanged)
     {
-        const int32_t vx1 = dmMath::Clamp(context->m_ViewportRect[0], 0, int32_t(context->m_CurrentRenderPass.m_Target->m_Width));
-        const int32_t vy1 = dmMath::Clamp(context->m_ViewportRect[1], 0, int32_t(context->m_CurrentRenderPass.m_Target->m_Height));
-        const int32_t vx2 = dmMath::Clamp(context->m_ViewportRect[2], 0, int32_t(context->m_CurrentRenderPass.m_Target->m_Width));
-        const int32_t vy2 = dmMath::Clamp(context->m_ViewportRect[3], 0, int32_t(context->m_CurrentRenderPass.m_Target->m_Height));
+        // The rect is GL's: x, y from the bottom-left, then width and height.
+        // An offscreen target is rendered flipped (see the flipped vertex entry
+        // point), so its rows already run bottom-up and y carries over; the
+        // backbuffer is not, so y is measured from its top instead.
+        const int32_t target_width  = int32_t(context->m_CurrentRenderPass.m_Target->m_Width);
+        const int32_t target_height = int32_t(context->m_CurrentRenderPass.m_Target->m_Height);
+        int32_t y = context->m_ViewportRect[1];
+        if (context->m_CurrentRenderPass.m_Target->m_Base.m_Id == DM_RENDERTARGET_BACKBUFFER_ID)
+            y = target_height - (y + context->m_ViewportRect[3]);
+        const int32_t vx1 = dmMath::Clamp(context->m_ViewportRect[0], 0, target_width);
+        const int32_t vy1 = dmMath::Clamp(y, 0, target_height);
+        const int32_t vx2 = dmMath::Clamp(context->m_ViewportRect[0] + context->m_ViewportRect[2], 0, target_width);
+        const int32_t vy2 = dmMath::Clamp(y + context->m_ViewportRect[3], 0, target_height);
         wgpuRenderPassEncoderSetViewport(context->m_CurrentRenderPass.m_Encoder, vx1, vy1, vx2 - vx1, vy2 - vy1, 0.0f, 1.0f);
         wgpuRenderPassEncoderSetScissorRect(context->m_CurrentRenderPass.m_Encoder, context->m_CurrentRenderPass.m_Target->m_Scissor[0], context->m_CurrentRenderPass.m_Target->m_Scissor[1], context->m_CurrentRenderPass.m_Target->m_Scissor[2], context->m_CurrentRenderPass.m_Target->m_Scissor[3]);
         context->m_ViewportChanged = 0;
@@ -2954,6 +3110,143 @@ static ProgramResourceBinding* WebGPUGetAssociatedTextureBinding(WebGPUProgram* 
     return &program->m_BaseProgram.m_ResourceBindings[texture_resource.m_Set][texture_resource.m_Binding];
 }
 
+// The texture a program texture binding reads this draw: the one on its unit.
+// NULL means the default texture, which also stands in for an attachment of
+// the current pass (sampling it there is a read/write hazard WebGPU rejects;
+// on GL it is a feedback loop with undefined results).
+static WebGPUTexture* WebGPUBoundTexture(WebGPUContext* context, ProgramResourceBinding* texture_binding)
+{
+    WebGPUTexture* texture = context->m_CurrentTextureUnits[texture_binding->m_TextureUnit];
+    WebGPURenderTarget* target = context->m_CurrentRenderPass.m_Target;
+    if (!texture || !target)
+        return texture;
+    dmOpaqueHandleContainer<uintptr_t>& assets = context->m_BaseContext.m_AssetHandleContainer;
+    for (uint32_t i = 0; i < target->m_Base.m_ColorAttachmentCount; ++i)
+    {
+        if (GetAssetFromContainer<WebGPUTexture>(assets, target->m_TextureColor[i]) == texture ||
+            (target->m_TextureResolve[i] && GetAssetFromContainer<WebGPUTexture>(assets, target->m_TextureResolve[i]) == texture))
+            return NULL;
+    }
+    if (target->m_TextureDepthStencil && GetAssetFromContainer<WebGPUTexture>(assets, target->m_TextureDepthStencil) == texture)
+        return NULL;
+    return texture;
+}
+
+static bool WebGPUIsUnfilterable(WebGPUContext* context, const WebGPUTexture* texture)
+{
+    switch (texture->m_Format)
+    {
+        case WGPUTextureFormat_Depth16Unorm:
+        case WGPUTextureFormat_Depth24Plus:
+        case WGPUTextureFormat_Depth24PlusStencil8:
+        case WGPUTextureFormat_Depth32Float:
+        case WGPUTextureFormat_Depth32FloatStencil8:
+            return true;
+        case WGPUTextureFormat_R32Float:
+        case WGPUTextureFormat_RG32Float:
+        case WGPUTextureFormat_RGBA32Float:
+            return !context->m_Float32Filterable;
+        default:
+            return false;
+    }
+}
+
+// GL samples a depth texture (or a 32-bit float one) through an ordinary
+// sampler2D; WebGPU binds those only as unfilterable float, read with a
+// non-filtering sampler, and a program's layout says which kind each binding
+// is. So the layout follows the textures actually bound: the units holding
+// such a texture form a mask, and each mask gets its own bind group and
+// pipeline layouts (made once, kept on the program). Without this a game that
+// samples its depth buffer draws nothing.
+static void WebGPUSelectLayoutVariant(WebGPUContext* context, WebGPUProgram* program)
+{
+    uint32_t mask = 0;
+    const dmArray<ShaderResourceBinding>& textures = program->m_BaseProgram.m_ShaderMeta.m_Textures;
+    for (uint32_t i = 0; i < textures.Size(); ++i)
+    {
+        const ShaderResourceBinding& res = textures[i];
+        switch (res.m_Type.m_ShaderType)
+        {
+            case ShaderDesc::SHADER_TYPE_TEXTURE2D:
+            case ShaderDesc::SHADER_TYPE_SAMPLER2D:
+            case ShaderDesc::SHADER_TYPE_TEXTURE2D_ARRAY:
+            case ShaderDesc::SHADER_TYPE_SAMPLER2D_ARRAY:
+            case ShaderDesc::SHADER_TYPE_TEXTURE_CUBE:
+            case ShaderDesc::SHADER_TYPE_SAMPLER_CUBE:
+                break;
+            default:
+                continue;
+        }
+        ProgramResourceBinding* binding = &program->m_BaseProgram.m_ResourceBindings[res.m_Set][res.m_Binding];
+        WebGPUTexture* texture = WebGPUBoundTexture(context, binding);
+        if (texture && binding->m_TextureUnit < 32 && WebGPUIsUnfilterable(context, texture))
+            mask |= 1u << binding->m_TextureUnit;
+    }
+    if (mask == program->m_UnfilterableMask || !program->m_LayoutVariantCount)
+        return;
+
+    WebGPUProgram::LayoutVariant* variant = NULL;
+    for (uint32_t i = 0; i < program->m_LayoutVariantCount; ++i)
+    {
+        if (program->m_LayoutVariants[i].m_Mask == mask)
+            variant = &program->m_LayoutVariants[i];
+    }
+    if (!variant)
+    {
+        if (program->m_LayoutVariantCount == WebGPUProgram::MAX_LAYOUT_VARIANTS)
+        {
+            dmLogWarning("WebGPU: a program met more than %u combinations of unfilterable textures; keeping its current layout", WebGPUProgram::MAX_LAYOUT_VARIANTS);
+            return;
+        }
+        variant = &program->m_LayoutVariants[program->m_LayoutVariantCount++];
+        variant->m_Mask = mask;
+        for (int set = 0; set < program->m_BaseProgram.m_MaxSet; ++set)
+        {
+#if defined(DM_GRAPHICS_WEBGPU2)
+            WGPUBindGroupLayoutDescriptor desc = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
+#else
+            WGPUBindGroupLayoutDescriptor desc = {};
+#endif
+            WGPUBindGroupLayoutEntry entries[MAX_BINDINGS_PER_SET_COUNT];
+            desc.entries = entries;
+            for (int binding = 0; binding < MAX_BINDINGS_PER_SET_COUNT; ++binding)
+            {
+                WGPUBindGroupLayoutEntry entry = program->m_LayoutEntries[set][binding];
+                if (entry.visibility == WGPUShaderStage_None)
+                    continue;
+                ProgramResourceBinding& pgm_res = program->m_BaseProgram.m_ResourceBindings[set][binding];
+                if (pgm_res.m_Res && pgm_res.m_Res->m_BindingFamily == BINDING_FAMILY_TEXTURE)
+                {
+                    const ProgramResourceBinding* texture_binding = WebGPUGetAssociatedTextureBinding(program, &pgm_res);
+                    if (texture_binding->m_TextureUnit < 32 && (mask & (1u << texture_binding->m_TextureUnit)))
+                    {
+                        if (pgm_res.m_Res->m_Type.m_ShaderType == ShaderDesc::SHADER_TYPE_SAMPLER)
+                            entry.sampler.type = WGPUSamplerBindingType_NonFiltering;
+                        else if (entry.texture.sampleType == WGPUTextureSampleType_Float)
+                            entry.texture.sampleType = WGPUTextureSampleType_UnfilterableFloat;
+                    }
+                }
+                entries[desc.entryCount++] = entry;
+            }
+            variant->m_BindGroupLayouts[set] = wgpuDeviceCreateBindGroupLayout(context->m_Device, &desc);
+        }
+#if defined(DM_GRAPHICS_WEBGPU2)
+        WGPUPipelineLayoutDescriptor desc = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+#else
+        WGPUPipelineLayoutDescriptor desc = {};
+#endif
+        desc.bindGroupLayouts     = variant->m_BindGroupLayouts;
+        desc.bindGroupLayoutCount = program->m_BaseProgram.m_MaxSet;
+        variant->m_PipelineLayout = wgpuDeviceCreatePipelineLayout(context->m_Device, &desc);
+    }
+
+    memcpy(program->m_BindGroupLayouts, variant->m_BindGroupLayouts, sizeof(program->m_BindGroupLayouts));
+    program->m_PipelineLayout   = variant->m_PipelineLayout;
+    program->m_UnfilterableMask = mask;
+    for (int set = 0; set < MAX_SET_COUNT; ++set)
+        program->m_BindGroups[set] = NULL;
+}
+
 static void WebGPUUpdateBindGroups(WebGPUContext* context)
 {
     for (int set = 0; set < context->m_CurrentProgram->m_BaseProgram.m_MaxSet; ++set)
@@ -2965,6 +3258,7 @@ static void WebGPUUpdateBindGroups(WebGPUContext* context)
         dmHashInit64(&bindgroup_hash_state, false);
         dmHashUpdateBuffer64(&bindgroup_hash_state, &set, sizeof(set));
         dmHashUpdateBuffer64(&bindgroup_hash_state, &context->m_CurrentProgram->m_Hash, sizeof(context->m_CurrentProgram->m_Hash));
+        dmHashUpdateBuffer64(&bindgroup_hash_state, &context->m_CurrentProgram->m_UnfilterableMask, sizeof(context->m_CurrentProgram->m_UnfilterableMask));
 
 #if defined(DM_GRAPHICS_WEBGPU2)
         WGPUBindGroupDescriptor desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
@@ -2987,7 +3281,7 @@ static void WebGPUUpdateBindGroups(WebGPUContext* context)
             {
                 case BINDING_FAMILY_TEXTURE: {
                     ProgramResourceBinding* texture_binding = WebGPUGetAssociatedTextureBinding(context->m_CurrentProgram, &pgm_res);
-                    WebGPUTexture* texture = context->m_CurrentTextureUnits[texture_binding->m_TextureUnit];
+                    WebGPUTexture* texture = WebGPUBoundTexture(context, texture_binding);
                     if (!texture)
                     {
                         switch (pgm_res.m_Res->m_Type.m_ShaderType)
@@ -3020,7 +3314,10 @@ static void WebGPUUpdateBindGroups(WebGPUContext* context)
                     if (pgm_res.m_Res->m_Type.m_ShaderType == ShaderDesc::SHADER_TYPE_SAMPLER)
                     {
                         assert(texture->m_Sampler);
-                        entries[desc.entryCount].sampler = texture->m_Sampler;
+                        const bool nearest = context->m_CurrentProgram->m_UnfilterableMask & (1u << texture_binding->m_TextureUnit);
+                        if (nearest && !texture->m_SamplerNearest)
+                            texture->m_SamplerNearest = WebGPUGetOrCreateSampler(context, TEXTURE_FILTER_NEAREST, TEXTURE_FILTER_NEAREST, TEXTURE_WRAP_CLAMP_TO_EDGE, TEXTURE_WRAP_CLAMP_TO_EDGE, TEXTURE_WRAP_CLAMP_TO_EDGE, 1.0f);
+                        entries[desc.entryCount].sampler = nearest ? texture->m_SamplerNearest : texture->m_Sampler;
                     }
                     else
                     {
@@ -3136,6 +3433,7 @@ static void WebGPUSetupComputePipeline(WebGPUContext* context)
 {
     TRACE_CALL;
     WebGPUBeginComputePass(context);
+    WebGPUSelectLayoutVariant(context, context->m_CurrentProgram);
     WebGPUUpdateBindGroups(context);
 
     // Get the pipeline for the active draw state
@@ -3158,6 +3456,7 @@ static void WebGPUSetupRenderPipeline(WebGPUContext* context, WebGPUBuffer* inde
 {
     TRACE_CALL;
     WebGPUBeginRenderPass(context, 0, 0, 0, 0);
+    WebGPUSelectLayoutVariant(context, context->m_CurrentProgram);
     WebGPUUpdateBindGroups(context);
 
     // Get the pipeline for the active draw state
@@ -3416,7 +3715,16 @@ static void WebGPUUpdateBindGroupLayouts(WebGPUContext* context, WebGPUProgram* 
                     }
                     else
                     {
-                        program_resource_binding.m_TextureUnit = info.m_TextureCount;
+                        // A sampled texture starts on unit 0, as a GL sampler
+                        // uniform does until it is set (WebGPUSetSampler sets
+                        // it, like glUniform1i). A shader may read a sampler
+                        // the engine never binds and rely on getting unit 0:
+                        // BRDF Deferred's combine pass samples an SSAO texture
+                        // it never binds and reads the lighting there. Storage
+                        // images keep their own units.
+                        const bool storage = res.m_Type.m_ShaderType == ShaderDesc::SHADER_TYPE_IMAGE2D ||
+                                             res.m_Type.m_ShaderType == ShaderDesc::SHADER_TYPE_UIMAGE2D;
+                        program_resource_binding.m_TextureUnit = storage ? info.m_TextureCount : 0;
                         info.m_TextureCount++;
                     }
                     break;
@@ -3520,6 +3828,15 @@ static void WebGPUUpdateProgramLayouts(WebGPUContext* context, WebGPUProgram* pr
         program->m_PipelineLayout         = wgpuDeviceCreatePipelineLayout(context->m_Device, &desc);
     }
 
+    // The layouts above are the variant with every texture filterable; keep
+    // the entries to make the others from (WebGPUSelectLayoutVariant).
+    memcpy(program->m_LayoutEntries, bindings, sizeof(program->m_LayoutEntries));
+    program->m_LayoutVariants[0].m_Mask = 0;
+    memcpy(program->m_LayoutVariants[0].m_BindGroupLayouts, program->m_BindGroupLayouts, sizeof(program->m_BindGroupLayouts));
+    program->m_LayoutVariants[0].m_PipelineLayout = program->m_PipelineLayout;
+    program->m_LayoutVariantCount = 1;
+    program->m_UnfilterableMask   = 0;
+
     BuildUniforms(&program->m_BaseProgram);
 }
 
@@ -3619,22 +3936,29 @@ static void WebGPUDestroyProgram(WebGPUContext* context, WebGPUProgram* program)
         delete[] program->m_UniformData;
         program->m_UniformData = NULL;
     }
+    // m_BindGroupLayouts and m_PipelineLayout are one of the variants.
+    for (uint32_t v = 0; v < program->m_LayoutVariantCount; ++v)
+    {
+        WebGPUProgram::LayoutVariant& variant = program->m_LayoutVariants[v];
+        for (size_t i = 0; i < MAX_SET_COUNT; ++i)
+        {
+            if (variant.m_BindGroupLayouts[i])
+                wgpuBindGroupLayoutRelease(variant.m_BindGroupLayouts[i]);
+            variant.m_BindGroupLayouts[i] = NULL;
+        }
+        if (variant.m_PipelineLayout)
+            wgpuPipelineLayoutRelease(variant.m_PipelineLayout);
+        variant.m_PipelineLayout = NULL;
+    }
+    program->m_LayoutVariantCount = 0;
     for (size_t i = 0; i < MAX_SET_COUNT; ++i)
     {
-        if (program->m_BindGroupLayouts[i])
-        {
-            wgpuBindGroupLayoutRelease(program->m_BindGroupLayouts[i]);
-            program->m_BindGroupLayouts[i] = NULL;
-        }
+        program->m_BindGroupLayouts[i] = NULL;
         // Bind groups are owned and released by m_BindGroupCache. Programs only
         // keep borrowed references to the currently selected cached groups.
         program->m_BindGroups[i] = NULL;
     }
-    if (program->m_PipelineLayout)
-    {
-        wgpuPipelineLayoutRelease(program->m_PipelineLayout);
-        program->m_PipelineLayout = NULL;
-    }
+    program->m_PipelineLayout = NULL;
 }
 
 static void WebGPUDeleteProgram(HContext context, HProgram _program)
@@ -4822,12 +5146,16 @@ static void WebGPUSetCullFace(HContext context, FaceType face_type)
 {
     TRACE_CALL;
     assert(context);
+    ((WebGPUContext*)context)->m_CurrentPipelineState.m_CullFaceType = face_type;
 }
 
-static void WebGPUSetPolygonOffset(HContext context, float factor, float units)
+static void WebGPUSetPolygonOffset(HContext _context, float factor, float units)
 {
     TRACE_CALL;
-    assert(context);
+    assert(_context);
+    WebGPUContext* context = (WebGPUContext*)_context;
+    context->m_PolygonOffsetFactor = factor;
+    context->m_PolygonOffsetUnits  = units;
 }
 
 static PipelineState WebGPUGetPipelineState(HContext context)
