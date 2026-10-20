@@ -116,11 +116,20 @@ migration script for pre-1.13 projects live in
 [wasmcart-defold-examples](https://github.com/wasmcart/wasmcart-defold-examples),
 which carries twelve carts including five complete games.
 
-## WebGPU carts
+## Dual GL and WebGPU carts
 
-The same build also produces a WebGPU cart (`wc_info_t.gpu_api = 2`) from
-Defold's own WebGPU adapter, when it is pointed at the emdawnwebgpu release the
-host's WebGPU glue was generated from. The cart carries the port's C++ half and
+The same build also produces a dual engine, with Defold's GL adapter and its
+own WebGPU adapter both linked in, when it is pointed at the emdawnwebgpu
+release the host's WebGPU glue was generated from. A cart on it is a wasmcart
+dual cart: it imports both APIs and declares `gpu_api = 2`, a host with
+WebGPU runs it on WebGPU and any other host (wasmcart-android,
+wasmcart-libretro, a machine with no WebGPU adapter) runs it on GL. The host
+says which in `WC_HOST_FLAG_GPU_WGPU` before `wc_init`, and the cart shim
+starts Defold with `--graphics-adapter=webgpu` or `=opengl` to match. One
+file per game serves every host; the dual engine is about 75 KB larger than
+the GL one.
+
+The WebGPU half carries the emdawnwebgpu port's C++ side and
 the host supplies the JavaScript half, so the two must be the same release
 (currently `v20261002.154047`). A cart built with Emscripten's old
 `-sUSE_WEBGPU` bindings is not compatible.
@@ -129,25 +138,25 @@ the host supplies the JavaScript half, so the two must be the same release
 export DEFOLD_EMDAWNWEBGPU_PORT=/path/to/emdawnwebgpu_pkg/emdawnwebgpu.port.py
 ./scripts/build.py --platform=wasm-web --skip-tests build_engine -- \
     --skip-build-tests --with-wasmcart
-# -> tmp/dynamo_home/bin/wasm-web/dmengine_wasmcart.wasm         (GL)
-# -> tmp/dynamo_home/bin/wasm-web/dmengine_wasmcart_webgpu.wasm  (WebGPU)
+# -> tmp/dynamo_home/bin/wasm-web/dmengine_wasmcart.wasm       (GL)
+# -> tmp/dynamo_home/bin/wasm-web/dmengine_wasmcart_dual.wasm  (GL + WebGPU)
 ```
 
-Without `DEFOLD_EMDAWNWEBGPU_PORT` only the GL cart is built. The value is
+Without `DEFOLD_EMDAWNWEBGPU_PORT` only the GL engine is built. The value is
 cached by CMake, so a later build without the variable keeps using it.
 
 Content needs WGSL shaders as well as GLSL ES. Add one flag to the bob command
-above; the resulting archive serves both carts:
+above; the resulting archive serves both adapters:
 
 ```bash
 java -jar bob.jar --root <game> --platform wasm-web --archive \
     --use-uncompressed-lua-source --debug-output-wgsl true build
 ```
 
-Pack it exactly like the GL cart, with `dmengine_wasmcart_webgpu.wasm` as the
-`--wasm`.
+Pack it exactly like a GL cart, with `dmengine_wasmcart_dual.wasm` as the
+`--wasm`. Content whose shaders do not compile to WGSL stays on the GL engine.
 
-How the WebGPU cart differs from Defold's browser WebGPU build:
+How the WebGPU adapter in a cart differs from Defold's browser WebGPU build:
 
 - **No Asyncify, no adapter or device request.** The host owns the device and
   `emscripten_webgpu_get_device()` returns it synchronously, so the adapter
@@ -159,7 +168,6 @@ How the WebGPU cart differs from Defold's browser WebGPU build:
   an uncaptured-error callback, so the adapter keeps a validation error scope
   open across each frame and pops it after the frame's submit. Errors arrive
   between frames and print as `WebGPU error (2): ...`.
-- **Only the WebGPU adapter is linked.** The cart imports no GL functions.
 
 The device is whatever the host created. Defold's sprite, label, GUI, particle
 and physics content renders without validation errors on a
@@ -175,7 +183,7 @@ extension-spine) needs an engine with that code linked in. The SDK makes one
 without building Defold: the engine's static libraries, the two cart entry
 objects, the headers, the recorded link lines, and `link.mjs`, which compiles a
 project's extensions the way Defold's Extender does and relinks both cart
-engines in seconds. A project with no native code gets the stock engines back
+engines (GL and dual) in seconds. A project with no native code gets the stock engines back
 byte for byte.
 
 ```bash
@@ -214,9 +222,10 @@ including Defold's WebGPU adapter (`engine/graphics/src/webgpu/`):
 ## ABI
 
 wasmcart ABI v4. The cart exports `wc_get_info`, `wc_init`, `wc_render` and the
-`wc_alloc`/`wc_free` pair the host writes cart memory through. The GL cart
-declares GLES3 as its GPU API and the WebGPU cart declares WebGPU
-(`gpu_api = 2`). Pads, pointer, keyboard, audio ring, save block and the host
+`wc_alloc`/`wc_free` pair the host writes cart memory through. A cart on the GL
+engine declares GLES3 as its GPU API; a dual cart declares WebGPU
+(`gpu_api = 2`), imports GL as well, and uses whichever the host selected
+(`WC_HOST_FLAG_GPU_WGPU`). Pads, pointer, keyboard, audio ring, save block and the host
 clock are all wired.
 
 `wc_get_info` is idempotent: a host may call it again after `wc_init` to pick up

@@ -4,7 +4,7 @@
 //
 // Usage: node link.mjs <project-dir> [options]
 //   --out DIR        where the engines go (default <project>/build/wasmcart-engine)
-//   --variant V      gl, webgpu or all (default all the SDK has)
+//   --variant V      gl, dual or all (default all the SDK has)
 //   --ext DIR        an extra extension folder (repeatable)
 //   --skip-ext NAME  leave out a native extension the project has (repeatable).
 //                    With --ext, this replaces a project's extension with
@@ -48,7 +48,7 @@ for (let i = 0; i < argv.length; i++) {
   else if (a.startsWith('-')) fail(`unknown option ${a}`);
   else project = path.resolve(a);
 }
-if (!project) fail('usage: node link.mjs <project-dir> [--out DIR] [--variant gl|webgpu|all] [--ext DIR] [--skip-ext NAME] [--emsdk DIR]');
+if (!project) fail('usage: node link.mjs <project-dir> [--out DIR] [--variant gl|dual|all] [--ext DIR] [--skip-ext NAME] [--emsdk DIR]');
 outDir = path.resolve(outDir || path.join(project, 'build/wasmcart-engine'));
 const variants = variantArg === 'all' ? Object.keys(manifest.variants) : variantArg.split(',');
 for (const v of variants) if (!manifest.variants[v]) fail(`this SDK has no ${v} engine (it has: ${Object.keys(manifest.variants).join(', ')})`);

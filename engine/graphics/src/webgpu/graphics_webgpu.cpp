@@ -65,11 +65,11 @@ using namespace dmVMath;
 //   - The host presents after wc_render; the cart never calls present.
 namespace dmGraphics
 {
-    // Per-frame counters the cart shim reports (also defined by the GL
-    // backend; a cart links exactly one of the two).
-    uint32_t g_WcDrawCalls = 0;
-    uint32_t g_WcTriangles = 0;
-    uint32_t g_WcFlips     = 0;
+    // Per-frame counters the cart shim reports. Defined by the GL backend,
+    // which the dual cart links beside this one.
+    extern uint32_t g_WcDrawCalls;
+    extern uint32_t g_WcTriangles;
+    extern uint32_t g_WcFlips;
 }
 
 static void WebGPUWasmcartPopErrorScopeCallback(WGPUPopErrorScopeStatus status, WGPUErrorType type, WGPUStringView message, void* userdata1, void*)

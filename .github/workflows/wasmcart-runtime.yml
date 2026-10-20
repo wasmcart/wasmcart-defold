@@ -1,6 +1,7 @@
 name: wasmcart runtime
 
-# Builds the cart runtime and publishes the two engine wasms (GL and WebGPU)
+# Builds the cart runtime and publishes the two engine wasms (GL, and dual GL +
+# WebGPU)
 # and the SDK that relinks them with native extensions. Those are the only
 # artifacts this project produces: the content compiler (bob) and the builtins
 # tree are upstream Defold's, so consumers take them from Defold's own archive.
@@ -132,7 +133,7 @@ jobs:
           } > tmp/emscripten_config
           cat tmp/emscripten_config
 
-      # The WebGPU cart links Dawn's emdawnwebgpu port, and must use the same
+      # The dual engine's WebGPU adapter links Dawn's emdawnwebgpu port, and must use the same
       # release the wasmcart host's WebGPU glue was generated from (wasmcart's
       # scripts/wgpu/emdawnwebgpu.json), so it is pinned and checksummed here.
       - name: Fetch the emdawnwebgpu release
@@ -185,7 +186,7 @@ jobs:
       # rather than trusting the exit code.
       - name: Verify the engines were actually produced
         run: |
-          for W in tmp/dynamo_home/bin/wasm-web/dmengine_wasmcart.wasm tmp/dynamo_home/bin/wasm-web/dmengine_wasmcart_webgpu.wasm; do
+          for W in tmp/dynamo_home/bin/wasm-web/dmengine_wasmcart.wasm tmp/dynamo_home/bin/wasm-web/dmengine_wasmcart_dual.wasm; do
             test -f "$W" || { echo "no engine at $W"; exit 1; }
             SZ=$(stat -c%s "$W")
             echo "$W: $SZ bytes"
@@ -203,9 +204,9 @@ jobs:
 
       # Prove the SDK before publishing it: relink with a one-function C++
       # extension, run the cart, require the extension's answer, and require
-      # the same project to fail on an engine relinked without it. GL only: the
-      # runner has Mesa's software GL but no WebGPU device. The WebGPU engine
-      # is the same relink with a different entry object and graphics library.
+      # the same project to fail on an engine relinked without it. Both engines,
+      # the dual one on GL only: the runner has Mesa's software GL but no
+      # WebGPU device.
       - name: Test the SDK
         env:
           LIBGL_ALWAYS_SOFTWARE: '1'
@@ -220,7 +221,7 @@ jobs:
           curl -fL --max-time 900 -o "$RUNNER_TEMP/bob.jar" \
             "https://d.defold.com/archive/stable/$BOB_SHA/bob/bob.jar"
           npm install --prefix "$RUNNER_TEMP/wc" --no-save --no-audit --no-fund wasmcart
-          node sdk/test/run.mjs --variant gl --bob "$RUNNER_TEMP/bob.jar" \
+          node sdk/test/run.mjs --no-webgpu --bob "$RUNNER_TEMP/bob.jar" \
             --wasmcart "$RUNNER_TEMP/wc/node_modules/wasmcart" --emsdk "$HOME/emsdk"
 
       # Only the engine is published: bob.jar and builtins are upstream
@@ -230,9 +231,9 @@ jobs:
         run: |
           mkdir -p dist
           cp tmp/dynamo_home/bin/wasm-web/dmengine_wasmcart.wasm dist/
-          cp tmp/dynamo_home/bin/wasm-web/dmengine_wasmcart_webgpu.wasm dist/
+          cp tmp/dynamo_home/bin/wasm-web/dmengine_wasmcart_dual.wasm dist/
           cp tmp/wasmcart-defold-sdk.tar.gz dist/
-          (cd dist && sha256sum dmengine_wasmcart.wasm dmengine_wasmcart_webgpu.wasm wasmcart-defold-sdk.tar.gz > SHA256SUMS)
+          (cd dist && sha256sum dmengine_wasmcart.wasm dmengine_wasmcart_dual.wasm wasmcart-defold-sdk.tar.gz > SHA256SUMS)
           du -sh dist/*
 
       - uses: actions/upload-artifact@v7
@@ -259,7 +260,7 @@ jobs:
             exit 0
           fi
           gh release upload "${GITHUB_REF_NAME}" \
-            dist/dmengine_wasmcart.wasm dist/dmengine_wasmcart_webgpu.wasm \
+            dist/dmengine_wasmcart.wasm dist/dmengine_wasmcart_dual.wasm \
             dist/wasmcart-defold-sdk.tar.gz dist/SHA256SUMS
         env:
           GH_TOKEN: ${{ github.token }}

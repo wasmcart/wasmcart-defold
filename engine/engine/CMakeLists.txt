@@ -468,11 +468,12 @@ function(engine_configure_executable target variant engine_lib engine_service_li
       defold_target_link_libraries(${target} "${TARGET_PLATFORM}" ${ENGINE_RECORD_NULL_EXECUTABLE_DEPENDENCIES} ${ENGINE_SOUND_LIBS})
     endif()
     defold_target_link_platform(${target} "${TARGET_PLATFORM}")
-    if(graphics_mode STREQUAL "wasmcart_webgpu")
-      # Listed ahead of everything else that drags in the GL `graphics`
-      # library (render links it), so the shared graphics objects and the
-      # adapter resolve from the WebGPU library.
+    if(graphics_mode STREQUAL "wasmcart_dual")
+      # Listed ahead of the GL `graphics` library, so the shared graphics
+      # objects resolve from the WebGPU library and only the GL adapter itself
+      # comes from `graphics`.
       target_link_libraries(${target} PRIVATE graphics_webgpu_wasmcart image graphics_transcoder_basisu basis_transcoder)
+      defold_target_link_graphics(${target} "${TARGET_PLATFORM}")
     else()
       defold_target_link_graphics(${target} "${TARGET_PLATFORM}")
     endif()
@@ -633,34 +634,36 @@ if(TARGET_PLATFORM_OS STREQUAL "web" AND DEFOLD_WASMCART)
 
   set_target_properties(dmengine_wasmcart PROPERTIES SUFFIX ".wasm")
 
-  # dmengine_wasmcart_webgpu: the same cart on the WebGPU adapter instead of
-  # GL (wc_info_t.gpu_api = 2). Built only when graphics_webgpu_wasmcart is,
-  # i.e. when DEFOLD_EMDAWNWEBGPU_PORT names the emdawnwebgpu release the host
-  # was generated from. No -sUSE_WEBGPU and no Asyncify: the host owns the
-  # device and hands it over synchronously.
+  # dmengine_wasmcart_dual: the same cart with both the GL and the WebGPU
+  # adapter, a wasmcart dual cart (wc_info_t.gpu_api = 2, imports both APIs).
+  # The host picks one and says which in host-info flags; the shim hands
+  # Defold that adapter. Built only when graphics_webgpu_wasmcart is, i.e.
+  # when DEFOLD_EMDAWNWEBGPU_PORT names the emdawnwebgpu release the host was
+  # generated from. No -sUSE_WEBGPU and no Asyncify: the host owns the device
+  # and hands it over synchronously.
   if(TARGET graphics_webgpu_wasmcart)
-    set(ENGINE_WASMCART_WEBGPU_SYMBOLS ${ENGINE_WASMCART_SYMBOLS})
-    list(REMOVE_ITEM ENGINE_WASMCART_WEBGPU_SYMBOLS
+    set(ENGINE_WASMCART_DUAL_SYMBOLS ${ENGINE_WASMCART_SYMBOLS})
+    list(REMOVE_ITEM ENGINE_WASMCART_DUAL_SYMBOLS
       GraphicsAdapterOpenGL GraphicsAdapterOpenGLES GraphicsAdapterVulkan GraphicsAdapterWebGPU)
-    list(APPEND ENGINE_WASMCART_WEBGPU_SYMBOLS GraphicsAdapterWebGPU)
-    set(ENGINE_WASMCART_WEBGPU_EXPORTS "${CMAKE_CURRENT_BINARY_DIR}/__exported_symbols_dmengine_wasmcart_webgpu.cpp")
-    defold_create_exported_symbols_file("${ENGINE_WASMCART_WEBGPU_EXPORTS}" "${ENGINE_WASMCART_WEBGPU_SYMBOLS}")
-    defold_add_executable(dmengine_wasmcart_webgpu
+    list(APPEND ENGINE_WASMCART_DUAL_SYMBOLS GraphicsAdapterOpenGL GraphicsAdapterWebGPU)
+    set(ENGINE_WASMCART_DUAL_EXPORTS "${CMAKE_CURRENT_BINARY_DIR}/__exported_symbols_dmengine_wasmcart_dual.cpp")
+    defold_create_exported_symbols_file("${ENGINE_WASMCART_DUAL_EXPORTS}" "${ENGINE_WASMCART_DUAL_SYMBOLS}")
+    defold_add_executable(dmengine_wasmcart_dual
       "${ENGINE_SRC_DIR}/wasmcart/wasmcart_main.cpp"
-      "${ENGINE_WASMCART_WEBGPU_EXPORTS}")
-    engine_configure_executable(dmengine_wasmcart_webgpu release engine_release engine_service_null wasmcart_webgpu "profile_null;profilerext_null" "ProfilerExt")
-    target_compile_definitions(dmengine_wasmcart_webgpu PRIVATE DM_PLATFORM_WASMCART DM_WASMCART_WEBGPU
+      "${ENGINE_WASMCART_DUAL_EXPORTS}")
+    engine_configure_executable(dmengine_wasmcart_dual release engine_release engine_service_null wasmcart_dual "profile_null;profilerext_null" "ProfilerExt")
+    target_compile_definitions(dmengine_wasmcart_dual PRIVATE DM_PLATFORM_WASMCART DM_WASMCART_DUAL
       WASMCART_BUILD="${WASMCART_BUILD_SHA}"
       WASMCART_VERSION="${ENGINE_VERSION}")
-    target_include_directories(dmengine_wasmcart_webgpu PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../platform/src")
-    target_link_options(dmengine_wasmcart_webgpu PRIVATE
+    target_include_directories(dmengine_wasmcart_dual PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../platform/src")
+    target_link_options(dmengine_wasmcart_dual PRIVATE
       -sSTANDALONE_WASM=1
       --no-entry
       -sERROR_ON_UNDEFINED_SYMBOLS=0
       -sEXPORTED_FUNCTIONS=_wc_get_info,_wc_init,_wc_render
       -sALLOW_MEMORY_GROWTH=1
       "--use-port=${DEFOLD_EMDAWNWEBGPU_PORT}")
-    set_target_properties(dmengine_wasmcart_webgpu PROPERTIES SUFFIX ".wasm")
+    set_target_properties(dmengine_wasmcart_dual PROPERTIES SUFFIX ".wasm")
   endif()
 endif()
 
@@ -712,8 +715,8 @@ if(TARGET dmengine_wasmcart)
     LIBRARY DESTINATION bin/${TARGET_PLATFORM}
     RUNTIME DESTINATION bin/${TARGET_PLATFORM})
 endif()
-if(TARGET dmengine_wasmcart_webgpu)
-  defold_install_targets(TARGETS dmengine_wasmcart_webgpu
+if(TARGET dmengine_wasmcart_dual)
+  defold_install_targets(TARGETS dmengine_wasmcart_dual
     LIBRARY DESTINATION bin/${TARGET_PLATFORM}
     RUNTIME DESTINATION bin/${TARGET_PLATFORM})
 endif()
@@ -729,7 +732,7 @@ endif()
 if(TARGET_PLATFORM MATCHES "^(wasm-web|wasm_pthread-web)$")
   set(ENGINE_WEB_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}")
   install(CODE "
-    foreach(_name IN ITEMS dmengine dmengine_release dmengine_headless dmengine_wasmcart dmengine_wasmcart_webgpu)
+    foreach(_name IN ITEMS dmengine dmengine_release dmengine_headless dmengine_wasmcart dmengine_wasmcart_dual)
       foreach(_suffix IN ITEMS .js.mem .js.symbols .js.map .wasm .wasm.map .wasm.debug.wasm)
         set(_file \"${ENGINE_WEB_OUTPUT_DIR}/\${_name}\${_suffix}\")
         if(EXISTS \"\${_file}\")

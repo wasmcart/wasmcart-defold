@@ -5,7 +5,7 @@ extensions can be relinked into a cart engine in seconds, without building
 Defold.
 
 A Defold project that uses only Lua needs none of this: pack it with the stock
-`dmengine_wasmcart.wasm` (or `dmengine_wasmcart_webgpu.wasm`). A project whose
+`dmengine_wasmcart.wasm` (or the dual GL + WebGPU `dmengine_wasmcart_dual.wasm`). A project whose
 dependencies include C++ (an `ext.manifest` with sources), such as
 extension-spine, needs an engine with that code linked in. Defold's editor
 gets one from its build server; a cart gets one from this SDK.
@@ -15,9 +15,9 @@ gets one from its build server; a cart gets one from this SDK.
 | Path | |
 | --- | --- |
 | `lib/` | the engine's static libraries (wasm objects), 48 of them |
-| `obj/gl`, `obj/webgpu` | the cart entry point (`wc_get_info`/`wc_init`/`wc_render`), built once per graphics backend |
+| `obj/gl`, `obj/dual` | the cart entry point (`wc_get_info`/`wc_init`/`wc_render`), built once per engine |
 | `include/` | the headers an extension compiles against, laid out as Defold's Extender lays them out |
-| `emdawnwebgpu_pkg/` | the Dawn emdawnwebgpu release the WebGPU engine links, the same one the wasmcart host's WebGPU glue was generated from |
+| `emdawnwebgpu_pkg/` | the Dawn emdawnwebgpu release the dual engine links, the same one the wasmcart host's WebGPU glue was generated from |
 | `js/` | the engine's emscripten JS libraries, kept only because the link line names them; a cart imports none of their functions |
 | `sdk.json` | versions, the extension compile flags, and each engine's link line, exported symbols and import list |
 | `link.mjs` | the relink tool |
@@ -34,18 +34,18 @@ java -jar bob.jar --root mygame resolve
 
 node wasmcart-defold-sdk/link.mjs mygame --out mygame/build/engine
 # -> mygame/build/engine/dmengine_wasmcart.wasm
-#    mygame/build/engine/dmengine_wasmcart_webgpu.wasm
+#    mygame/build/engine/dmengine_wasmcart_dual.wasm
 ```
 
 Then build the content with bob as usual (`--platform wasm-web --archive
---use-uncompressed-lua-source`, plus `--debug-output-wgsl true` for the WebGPU
+--use-uncompressed-lua-source`, plus `--debug-output-wgsl true` for a dual
 cart) and pack it with the relinked engine as the cart's `--wasm`.
 
 `link.mjs` finds extensions the way bob does: every folder with an
 `ext.manifest` in the project, and in the dependency zips bob resolved into
 `.internal/lib`. Options:
 
-- `--variant gl|webgpu` relinks one engine instead of both.
+- `--variant gl|dual` relinks one engine instead of both.
 - `--ext DIR` adds an extension folder from outside the project.
 - `--skip-ext NAME` leaves one out, by its manifest `name`.
 
@@ -82,7 +82,7 @@ or `--skip-ext`.
 ## Making the SDK
 
 From a wasmcart-defold tree, after building the engine (see the top-level
-README; set `DEFOLD_EMDAWNWEBGPU_PORT` to include the WebGPU engine):
+README; set `DEFOLD_EMDAWNWEBGPU_PORT` to include the dual engine):
 
 ```bash
 node sdk/make-sdk.mjs --tar
@@ -90,7 +90,8 @@ node sdk/make-sdk.mjs --tar
 ```
 
 `sdk/test/run.mjs` proves it: it relinks both engines with a one-function
-C++ extension (`sdk/test/probe`), runs each cart on the wasmcart Node host and
+C++ extension (`sdk/test/probe`), runs each cart on the wasmcart Node host
+(the dual one on GL and on WebGPU; `--no-webgpu` skips the latter) and
 requires the extension's answer, and requires the same project on engines
 relinked without the extension to fail.
 

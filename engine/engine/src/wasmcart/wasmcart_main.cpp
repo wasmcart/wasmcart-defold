@@ -46,6 +46,9 @@ extern "C" void dmExportedSymbols(); // Found in "__exported_symbols.cpp"
 #define WC_FLAG_POINTER    (1 << 3)
 #define WC_FLAG_KEYBOARD   (1 << 4)
 
+// wc_host_info_t.flags, written by the host before wc_init.
+#define WC_HOST_FLAG_GPU_WGPU (1 << 1)
+
 // The sound device (device_wasmcart.cpp) owns the ring; the shim only
 // publishes its address so the host knows where to drain from.
 namespace dmEngine
@@ -215,8 +218,10 @@ wc_info_t* wc_get_info(void)
     g_Info.version     = WC_ABI_VERSION;
     g_Info.width       = s_ResolutionResolved ? resolved_w : WASMCART_DEFAULT_WIDTH;
     g_Info.height      = s_ResolutionResolved ? resolved_h : WASMCART_DEFAULT_HEIGHT;
-#if defined(DM_WASMCART_WEBGPU)
-    // Built on the WebGPU adapter against the host's emdawnwebgpu release.
+#if defined(DM_WASMCART_DUAL)
+    // A dual cart: both adapters are linked, so it imports GL and WebGPU. It
+    // declares WebGPU, and the host may still pick GL (WC_HOST_FLAG_GPU_WGPU,
+    // read in wc_init).
     g_Info.gpu_api     = WC_GPU_API_WEBGPU;
 #else
     g_Info.gpu_api     = WC_GPU_API_GLES3;
@@ -270,12 +275,24 @@ void wc_init(void)
     dmExportedSymbols();
     dmEngineInitialize();
 
-    // argv[0] only: the engine reads game.projectc out of the mounted
-    // archive, so there is no command line to pass through.
+    // The engine reads game.projectc out of the mounted archive, so there is
+    // no command line to pass through. A dual cart names the adapter the host
+    // selected: the host binds the other API's imports to functions that
+    // throw, and Defold would otherwise pick WebGPU by priority on any host.
     static char  s_Arg0[] = "dmengine";
+#if defined(DM_WASMCART_DUAL)
+    static char  s_ArgWebGPU[] = "--graphics-adapter=webgpu";
+    static char  s_ArgOpenGL[] = "--graphics-adapter=opengl";
+    const bool   use_webgpu = (g_HostInfo.flags & WC_HOST_FLAG_GPU_WGPU) != 0;
+    static char* s_Argv[] = { s_Arg0, 0, 0 };
+    s_Argv[1] = use_webgpu ? s_ArgWebGPU : s_ArgOpenGL;
+    const int    argc = 2;
+#else
     static char* s_Argv[] = { s_Arg0, 0 };
+    const int    argc = 1;
+#endif
 
-    g_Engine = dmEngineCreate(1, s_Argv);
+    g_Engine = dmEngineCreate(argc, s_Argv);
     if (!g_Engine)
     {
         WC_LOG("defold-wasmcart: dmEngineCreate failed");

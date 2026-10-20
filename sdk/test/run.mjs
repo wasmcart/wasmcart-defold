@@ -2,18 +2,19 @@
 // run.mjs: prove the SDK relinks a native extension into both cart engines.
 //
 // Builds the probe project (a Lua script calling a C++ extension), relinks the
-// engines with the SDK, packs a GL and a WebGPU cart, runs each on the
-// wasmcart Node host and requires the probe's PASS line. The same project on
+// engines with the SDK, packs a cart on each, runs each on the wasmcart Node
+// host (the dual one on GL and on WebGPU) and requires the probe's PASS line. The same project on
 // engines relinked WITHOUT the extension (--skip-ext) must FAIL: that is the
 // control showing the PASS comes from the linked extension.
 //
-// Usage: node sdk/test/run.mjs [--sdk DIR] [--bob JAR] [--wasmcart DIR] [--emsdk DIR] [--variant V]
+// Usage: node sdk/test/run.mjs [--sdk DIR] [--bob JAR] [--wasmcart DIR] [--emsdk DIR] [--variant V] [--no-webgpu]
 //   --sdk       the SDK (default tmp/wasmcart-defold-sdk, from make-sdk.mjs)
 //   --bob       Defold's bob.jar matching the engine version (default $BOB_JAR)
 //   --wasmcart  a wasmcart checkout or package (default ../wasmcart)
 //   --emsdk     passed through to link.mjs (default $EMSDK)
-//   --variant   gl or webgpu to run one cart (default every engine the SDK has;
-//               CI runs gl, since a runner has software GL but no WebGPU device)
+//   --variant   gl or dual to run one engine (default every engine the SDK has)
+//   --no-webgpu run the dual cart on GL only (CI: a runner has software GL
+//               but no WebGPU device)
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -30,6 +31,7 @@ const WASMCART = path.resolve(opt('--wasmcart', path.join(ROOT, '../wasmcart')))
 const EMSDK = opt('--emsdk', process.env.EMSDK);
 const JAVA = process.env.JAVA || 'java';
 const ONLY = opt('--variant', null);
+const NO_WEBGPU = argv.includes('--no-webgpu');
 
 function fail(msg) { console.error(`sdk test: FAIL ${msg}`); process.exit(1); }
 if (!BOB || !fs.existsSync(BOB)) fail('pass --bob <bob.jar> or set BOB_JAR');
@@ -50,7 +52,7 @@ for (const f of ['game.arci', 'game.arcd', 'game.dmanifest', 'game.projectc']) {
 const { CartHost } = await import(pathToFileURL(path.join(WASMCART, 'index.js')).href);
 const pack = path.join(WASMCART, 'bin/wasmcart-pack.js');
 
-async function runCart(wasm, label) {
+async function runCart(wasm, label, hostOpts) {
   const cart = path.join(work, `${label}.wasc`);
   execFileSync(process.execPath, [pack, '--wasm', wasm, '--assets', assets, '--name', 'sdkprobe',
     '--width', '320', '--height', '240', '--output', cart], { stdio: 'ignore' });
@@ -59,7 +61,8 @@ async function runCart(wasm, label) {
   console.log = console.error = console.warn = (...a) => lines.push(a.join(' '));
   const host = new CartHost();
   try {
-    await host.load(cart, { adapterOptions: { powerPreference: 'low-power' } });
+    await host.load(cart, hostOpts);
+    if (hostOpts.wgpu !== false && !host.usesWgpu) return '(the host ran the dual cart on GL, not WebGPU)';
     for (let f = 0; f < 10; f++) host.runFrame([]);
   } finally {
     host.destroy?.();
@@ -77,15 +80,21 @@ link(withExt, []);
 link(without, ['--skip-ext', 'SdkProbe']);
 
 let bad = 0;
+// A dual cart runs on whichever API the host picks, so it is run on both.
+const GL = { wgpu: false };
+const WEBGPU = { adapterOptions: { powerPreference: 'low-power' } };
 for (const [variant, spec] of Object.entries(manifest.variants)) {
   if (ONLY && variant !== ONLY) continue;
-  const got = await runCart(path.join(withExt, spec.output), `${variant}-with`);
-  const ctl = await runCart(path.join(without, spec.output), `${variant}-without`);
-  const ok = /sdkprobe: PASS/.test(got), ctlFailed = /sdkprobe: FAIL/.test(ctl);
-  console.log(`${variant.padEnd(6)} with the extension:    ${got}`);
-  console.log(`${variant.padEnd(6)} without (control):     ${ctl}`);
-  if (!ok) { bad++; console.log(`  -> the relinked ${variant} engine did not run the extension`); }
-  if (!ctlFailed) { bad++; console.log(`  -> the control did not fail, so the PASS proves nothing`); }
+  const runs = variant === 'dual' ? [['dual/gl', GL], ...(NO_WEBGPU ? [] : [['dual/webgpu', WEBGPU]])] : [[variant, GL]];
+  for (const [label, hostOpts] of runs) {
+    const got = await runCart(path.join(withExt, spec.output), `${label.replace('/', '-')}-with`, hostOpts);
+    const ctl = await runCart(path.join(without, spec.output), `${label.replace('/', '-')}-without`, hostOpts);
+    const ok = /sdkprobe: PASS/.test(got), ctlFailed = /sdkprobe: FAIL/.test(ctl);
+    console.log(`${label.padEnd(11)} with the extension:    ${got}`);
+    console.log(`${label.padEnd(11)} without (control):     ${ctl}`);
+    if (!ok) { bad++; console.log(`  -> the relinked ${label} engine did not run the extension`); }
+    if (!ctlFailed) { bad++; console.log(`  -> the control did not fail, so the PASS proves nothing`); }
+  }
 }
 if (bad) fail(`${bad} check(s) failed`);
 console.log('sdk test: PASS');

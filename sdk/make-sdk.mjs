@@ -31,10 +31,13 @@ const opt = (name, dflt) => { const i = args.indexOf(name); return i >= 0 ? args
 const OUT = path.resolve(opt('--out', path.join(ROOT, 'tmp/wasmcart-defold-sdk')));
 const TAR = args.includes('--tar');
 
-/** The two engines the SDK can relink, keyed by the name link.mjs uses. */
+/**
+ * The two engines the SDK can relink, keyed by the name link.mjs uses: GL only,
+ * and dual (the GL and the WebGPU adapter, a wasmcart dual cart).
+ */
 const VARIANTS = {
   gl: 'dmengine_wasmcart',
-  webgpu: 'dmengine_wasmcart_webgpu',
+  dual: 'dmengine_wasmcart_dual',
 };
 
 function fail(msg) { console.error(`make-sdk: ${msg}`); process.exit(1); }
@@ -110,7 +113,7 @@ for (const [variant, target] of Object.entries(VARIANTS)) {
   const toks = linkCommand(target);
   if (!toks) {
     if (variant === 'gl') fail(`no link line for ${target}; build the engine first (see the header of this file)`);
-    console.warn(`make-sdk: ${target} is not in this build (DEFOLD_EMDAWNWEBGPU_PORT unset?); the SDK will relink GL only`);
+    console.warn(`make-sdk: ${target} is not in this build (DEFOLD_EMDAWNWEBGPU_PORT unset?); the SDK will relink the GL engine only`);
     continue;
   }
   const v = { output: `${target}.wasm`, objects: [], libs: [], jsLibs: [], flags: [], symbols: [], port: null };
