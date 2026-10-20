@@ -1175,9 +1175,25 @@ static WGPUComputePipeline WebGPUGetOrCreateComputePipeline(WebGPUContext* conte
     return pipeline;
 }
 
+// Whether a target is drawn with clip-space Y flipped, so that its rows run
+// bottom-up as GL's do (see the flipped vertex entry point). Offscreen targets
+// always are, which keeps render target textures GL-oriented. A wasmcart cart
+// draws its backbuffer that way too and presents it right side up
+// (WebGPUWasmcartPresent), so gl_FragCoord.y and dFdy run bottom-up there as on
+// GL; a shader that reads them on the backbuffer otherwise sees them mirrored.
+static inline bool WebGPUTargetDrawsFlipped(const WebGPURenderTarget* target)
+{
+#if defined(DM_GRAPHICS_WEBGPU_WASMCART)
+    (void)target;
+    return true;
+#else
+    return target->m_Base.m_Id != DM_RENDERTARGET_BACKBUFFER_ID;
+#endif
+}
+
 static WGPURenderPipeline WebGPUGetOrCreateRenderPipeline(WebGPUContext* context)
 {
-    const bool use_flipped_vertex_entry_point = context->m_CurrentRenderPass.m_Target->m_Base.m_Id != DM_RENDERTARGET_BACKBUFFER_ID;
+    const bool use_flipped_vertex_entry_point = WebGPUTargetDrawsFlipped(context->m_CurrentRenderPass.m_Target);
 
     HashState64 pipeline_hash_state;
     dmHashInit64(&pipeline_hash_state, false);
@@ -2459,13 +2475,13 @@ static void WebGPUBeginRenderPass(WebGPUContext* context, uint32_t clear_flags, 
     if (context->m_ViewportChanged)
     {
         // The rect is GL's: x, y from the bottom-left, then width and height.
-        // An offscreen target is rendered flipped (see the flipped vertex entry
-        // point), so its rows already run bottom-up and y carries over; the
-        // backbuffer is not, so y is measured from its top instead.
+        // A target drawn flipped (WebGPUTargetDrawsFlipped) has its rows
+        // bottom-up already and y carries over; otherwise y is measured from
+        // the top instead.
         const int32_t target_width  = int32_t(context->m_CurrentRenderPass.m_Target->m_Width);
         const int32_t target_height = int32_t(context->m_CurrentRenderPass.m_Target->m_Height);
         int32_t y = context->m_ViewportRect[1];
-        if (context->m_CurrentRenderPass.m_Target->m_Base.m_Id == DM_RENDERTARGET_BACKBUFFER_ID)
+        if (!WebGPUTargetDrawsFlipped(context->m_CurrentRenderPass.m_Target))
             y = target_height - (y + context->m_ViewportRect[3]);
         const int32_t vx1 = dmMath::Clamp(context->m_ViewportRect[0], 0, target_width);
         const int32_t vy1 = dmMath::Clamp(y, 0, target_height);
@@ -2542,6 +2558,45 @@ static void WebGPUBeginFrame(HContext _context)
             textureViewDesc.mipLevelCount             = 1;
             currentColorTextureView                   = wgpuTextureCreateView(currentColorTexture, &textureViewDesc);
         }
+#if defined(DM_GRAPHICS_WEBGPU_WASMCART)
+        // The frame is drawn into m_Backbuffer, flipped; the surface texture is
+        // kept for WebGPUWasmcartPresent.
+        context->m_SurfaceTexture = currentColorTexture;
+        context->m_SurfaceView    = currentColorTextureView;
+        if (!context->m_Backbuffer || context->m_BackbufferWidth != currentWidth || context->m_BackbufferHeight != currentHeight)
+        {
+            if (context->m_PresentBindGroup)
+                wgpuBindGroupRelease(context->m_PresentBindGroup);
+            context->m_PresentBindGroup = NULL;
+            if (context->m_BackbufferView)
+                wgpuTextureViewRelease(context->m_BackbufferView);
+            if (context->m_Backbuffer)
+                wgpuTextureRelease(context->m_Backbuffer);
+#if defined(DM_GRAPHICS_WEBGPU2)
+            WGPUTextureDescriptor desc = WGPU_TEXTURE_DESCRIPTOR_INIT;
+#else
+            WGPUTextureDescriptor desc = {};
+            desc.mipLevelCount = 1;
+            desc.sampleCount   = 1;
+            desc.dimension     = WGPUTextureDimension_2D;
+#endif
+            desc.size.width              = currentWidth;
+            desc.size.height             = currentHeight;
+            desc.size.depthOrArrayLayers = 1;
+            desc.format                  = context->m_Format;
+            desc.usage                   = (WGPUTextureUsage)(g_rendertarget_usage | WGPUTextureUsage_TextureBinding);
+            context->m_Backbuffer        = wgpuDeviceCreateTexture(context->m_Device, &desc);
+            context->m_BackbufferView    = wgpuTextureCreateView(context->m_Backbuffer, NULL);
+            context->m_BackbufferWidth   = currentWidth;
+            context->m_BackbufferHeight  = currentHeight;
+        }
+        // The main target borrows the backbuffer; WebGPUFlip releases what it
+        // holds, so it gets its own references.
+        wgpuTextureAddRef(context->m_Backbuffer);
+        wgpuTextureViewAddRef(context->m_BackbufferView);
+        currentColorTexture     = context->m_Backbuffer;
+        currentColorTextureView = context->m_BackbufferView;
+#endif
 
         if (context->m_MainRenderTarget->m_Multisample == 1) {
             WebGPUTexture* textureColor = GetAssetFromContainer<WebGPUTexture>(context->m_BaseContext.m_AssetHandleContainer, context->m_MainRenderTarget->m_Base.m_TextureColor[0]);
@@ -2609,13 +2664,98 @@ static void WebGPUBeginFrame(HContext _context)
     context->m_ApplyRenderTargetLoadOps = 1;
 }
 
+#if defined(DM_GRAPHICS_WEBGPU_WASMCART)
+// Copies the backbuffer, drawn flipped (WebGPUTargetDrawsFlipped), to the
+// surface right side up.
+static const char* g_WasmcartPresentWGSL =
+    "@group(0) @binding(0) var src : texture_2d<f32>;\n"
+    "@vertex fn vs(@builtin(vertex_index) i : u32) -> @builtin(position) vec4f {\n"
+    "  var p = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));\n"
+    "  return vec4f(p[i], 0.0, 1.0);\n"
+    "}\n"
+    "@fragment fn fs(@builtin(position) pos : vec4f) -> @location(0) vec4f {\n"
+    "  let size = vec2i(textureDimensions(src));\n"
+    "  return textureLoad(src, vec2i(i32(pos.x), size.y - 1 - i32(pos.y)), 0);\n"
+    "}\n";
+
+static void WebGPUWasmcartPresent(WebGPUContext* context)
+{
+    if (!context->m_SurfaceView || !context->m_BackbufferView)
+        return;
+    if (!context->m_PresentPipeline)
+    {
+        WGPUShaderModuleDescriptor shader_desc = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+        WGPUShaderSourceWGSL wgsl = WGPU_SHADER_SOURCE_WGSL_INIT;
+        wgsl.code.data            = g_WasmcartPresentWGSL;
+        wgsl.code.length          = strlen(g_WasmcartPresentWGSL);
+        shader_desc.nextInChain   = (WGPUChainedStruct*)&wgsl;
+        WGPUShaderModule module   = wgpuDeviceCreateShaderModule(context->m_Device, &shader_desc);
+
+        WGPUColorTargetState target = WGPU_COLOR_TARGET_STATE_INIT;
+        target.format               = context->m_Format;
+        WGPUFragmentState fragment  = WGPU_FRAGMENT_STATE_INIT;
+        fragment.module             = module;
+        fragment.entryPoint         = WGPUStringView{ "fs", 2 };
+        fragment.targetCount        = 1;
+        fragment.targets            = &target;
+        WGPURenderPipelineDescriptor desc = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+        desc.vertex.module          = module;
+        desc.vertex.entryPoint      = WGPUStringView{ "vs", 2 };
+        desc.fragment               = &fragment;
+        context->m_PresentPipeline  = wgpuDeviceCreateRenderPipeline(context->m_Device, &desc);
+        wgpuShaderModuleRelease(module);
+    }
+    if (!context->m_PresentBindGroup)
+    {
+        WGPUBindGroupEntry entry = WGPU_BIND_GROUP_ENTRY_INIT;
+        entry.binding            = 0;
+        entry.textureView        = context->m_BackbufferView;
+        WGPUBindGroupDescriptor desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+        WGPUBindGroupLayout layout   = wgpuRenderPipelineGetBindGroupLayout(context->m_PresentPipeline, 0);
+        desc.layout                  = layout;
+        desc.entryCount              = 1;
+        desc.entries                 = &entry;
+        context->m_PresentBindGroup  = wgpuDeviceCreateBindGroup(context->m_Device, &desc);
+        wgpuBindGroupLayoutRelease(layout);
+    }
+
+    WebGPUEndComputePass(context);
+    WebGPUEndRenderPass(context);
+    WebGPUCreateCommandEncoder(context);
+    WGPURenderPassColorAttachment color = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
+    color.view                          = context->m_SurfaceView;
+    color.loadOp                        = WGPULoadOp_Clear;
+    color.storeOp                       = WGPUStoreOp_Store;
+    WGPURenderPassDescriptor pass_desc  = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
+    pass_desc.colorAttachmentCount      = 1;
+    pass_desc.colorAttachments          = &color;
+    WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(context->m_CommandEncoder, &pass_desc);
+    wgpuRenderPassEncoderSetPipeline(pass, context->m_PresentPipeline);
+    wgpuRenderPassEncoderSetBindGroup(pass, 0, context->m_PresentBindGroup, 0, NULL);
+    wgpuRenderPassEncoderDraw(pass, 3, 1, 0, 0);
+    wgpuRenderPassEncoderEnd(pass);
+    wgpuRenderPassEncoderRelease(pass);
+}
+#endif
+
 static void WebGPUFlip(HContext _context)
 {
     TRACE_CALL;
     WebGPUContext* context = (WebGPUContext*)_context;
     if (context->m_BaseContext.m_VerifyGraphicsCalls && context->m_HasValidationError)
         dmLogFatal("WebGPU validation failed; see the preceding uncaptured error");
+#if defined(DM_GRAPHICS_WEBGPU_WASMCART)
+    WebGPUWasmcartPresent(context);
+#endif
     WebGPUSubmitCommandEncoder(context);
+#if defined(DM_GRAPHICS_WEBGPU_WASMCART)
+    if (context->m_SurfaceView)
+        wgpuTextureViewRelease(context->m_SurfaceView);
+    if (context->m_SurfaceTexture)
+        wgpuTextureRelease(context->m_SurfaceTexture);
+    context->m_SurfaceView    = NULL;
+    context->m_SurfaceTexture = NULL;
+#endif
     context->m_CurrentRenderTarget = NULL;
 #if defined(DM_GRAPHICS_WEBGPU_WASMCART)
     g_WcFlips++;

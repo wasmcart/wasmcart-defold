@@ -253,6 +253,18 @@ namespace dmGraphics
         WGPUSurface                        m_Surface;
         WGPUTextureFormat                  m_Format;
         WGPUCommandEncoder                 m_CommandEncoder;
+#if defined(DM_GRAPHICS_WEBGPU_WASMCART)
+        // The backbuffer is drawn flipped into m_Backbuffer, then copied
+        // right side up to the surface at flip (see WebGPUWasmcartPresent).
+        WGPUTexture                        m_Backbuffer;
+        WGPUTextureView                    m_BackbufferView;
+        uint32_t                           m_BackbufferWidth;
+        uint32_t                           m_BackbufferHeight;
+        WGPUTexture                        m_SurfaceTexture;
+        WGPUTextureView                    m_SurfaceView;
+        WGPURenderPipeline                 m_PresentPipeline;
+        WGPUBindGroup                      m_PresentBindGroup;
+#endif
         uint32_t                           m_RenderPasses;
         uint32_t                           m_LastSubmittedRenderPass;
 
