@@ -35,6 +35,45 @@ Upstream Defold is **vendored, not forked** (see
 [How this repo is organised](#how-this-repo-is-organised)). Upstream's own
 README is kept as [`docs/upstream/README_DEFOLD.md`](docs/upstream/README_DEFOLD.md).
 
+## Quick start
+
+**Just want to play something?** Prebuilt carts are attached to the
+[latest wasmcart-defold-examples release](https://github.com/wasmcart/wasmcart-defold-examples/releases/latest):
+Breakout, Planetoid, Exolon: REDUX, Mystery Mansion and seven 3D showcase
+games. With Node installed, play one straight from its URL:
+
+```bash
+npx wasmcart https://github.com/wasmcart/wasmcart-defold-examples/releases/latest/download/breakout.wasc
+```
+
+To write your own, start from the examples repo. There is no engine to build:
+each wasmcart-defold release attaches the prebuilt engines. You need Node,
+Java 25 (Defold's `bob.jar` is built for it), git, curl, rsync and zip.
+
+```bash
+git clone https://github.com/wasmcart/wasmcart-defold-examples
+cd wasmcart-defold-examples
+npm install --no-save wasmcart             # the cart packer
+TAG=$(sed -n 's/^wasmcart-defold = //p' engine.lock)   # the engine release it pins
+mkdir -p engine && for f in dmengine_wasmcart.wasm dmengine_wasmcart_dual.wasm; do
+  curl -fLo engine/$f https://github.com/wasmcart/wasmcart-defold/releases/download/$TAG/$f
+done
+cp -r breakout my-game                     # edit my-game/main/main.script
+ENGINE_DIR=$PWD/engine ./build-cart.sh my-game   # -> my-game/my-game.wasc
+npx wasmcart my-game/my-game.wasc
+```
+
+The first build downloads Defold 1.14.0's `bob.jar` (about 220 MB, cached
+under `~/.cache/wasmcart-defold`). After that the loop is: edit, rerun the
+last two lines. `build-cart.sh` reads the title and size from `game.project`,
+builds the content with bob and packs it with the prebuilt engine into one
+dual GL and WebGPU cart. A project made in the Defold editor builds the same
+way, `ENGINE_DIR=$PWD/engine ./build-cart.sh /path/to/project`; use editor
+1.14.0, the Defold release the engine is.
+
+A project with C++ native extensions also needs an engine with that code
+linked in; see [Native extensions: the SDK](#native-extensions-the-sdk).
+
 ## What works
 
 | | |
