@@ -138,14 +138,13 @@ namespace dmPlatform
         return 0;
     }
 
-    // Defold's key constants must be a dense range: dmHID subtracts
-    // PLATFORM_KEY_START and indexes a fixed MAX_KEY_COUNT bitfield with the
-    // result (hid.cpp GetKey/SetKey). The wasmcart host, by contrast, reports
-    // a 256-bit mask indexed by USB HID scancode. So the constants below stay
-    // dense, matching the null/GLFW backends, and this table maps each one to
-    // its HID scancode. 0 means "no HID equivalent" and always reads as up.
+    // The wasmcart host reports a 256-bit key mask indexed by USB HID
+    // scancode. This table maps each special key constant below (ESC is
+    // 256 + 1, BACK 256 + 57) to its HID scancode, indexed by constant - 256;
+    // printable keys arrive as their ASCII code and are mapped in GetKey.
+    // 0 means "no HID equivalent" and always reads as up.
     static const uint8_t WASMCART_KEY_TO_HID[] = {
-        0x00, // PLATFORM_KEY_START (unused sentinel)
+        0x00, // 256: unused (no key constant is 256 + 0)
         0x29, // ESC
         0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F, // F1..F6
         0x40, 0x41, 0x42, 0x43, 0x44, 0x45, // F7..F12
@@ -195,9 +194,10 @@ namespace dmPlatform
         }
 
         uint8_t hid;
-        if (code < (int32_t) (sizeof(WASMCART_KEY_TO_HID) / sizeof(WASMCART_KEY_TO_HID[0])))
+        if (code >= 256)
         {
-            hid = WASMCART_KEY_TO_HID[code];
+            int32_t i = code - 256;
+            hid = i < (int32_t) (sizeof(WASMCART_KEY_TO_HID) / sizeof(WASMCART_KEY_TO_HID[0])) ? WASMCART_KEY_TO_HID[i] : 0;
         }
         else
         {
@@ -598,68 +598,73 @@ namespace dmPlatform
         return 0;
     }
 
-    // Dense key constants, matching platform_window_null.cpp. dmHID indexes a
-    // fixed-size bitfield with (key - PLATFORM_KEY_START), so these cannot be
-    // sparse HID scancodes; WASMCART_KEY_TO_HID above does that translation.
+    // Key constants. dmHID asks GetKey() for a printable key by its ASCII code
+    // (hid.cpp GetKeyValue: any key below HID_SPECIAL_START is passed through
+    // as its character) and for a special key by the constant below, so the
+    // specials must sit above the ASCII range, as GLFW 2 puts them at 256 and
+    // up. They were 1..57 once, copied from platform_window_null.cpp, and then
+    // Space (32) read the END key and the digits 0-9 (48-57) read KP_EQUAL to
+    // BACK: no cart saw Space or a number key. WASMCART_KEY_TO_HID above is
+    // indexed by (constant - 256).
     const int PLATFORM_KEY_START           = 0;
     const int PLATFORM_JOYSTICK_LAST       = 0;
-    const int PLATFORM_KEY_ESC             = 1;
-    const int PLATFORM_KEY_F1              = 2;
-    const int PLATFORM_KEY_F2              = 3;
-    const int PLATFORM_KEY_F3              = 4;
-    const int PLATFORM_KEY_F4              = 5;
-    const int PLATFORM_KEY_F5              = 6;
-    const int PLATFORM_KEY_F6              = 7;
-    const int PLATFORM_KEY_F7              = 8;
-    const int PLATFORM_KEY_F8              = 9;
-    const int PLATFORM_KEY_F9              = 10;
-    const int PLATFORM_KEY_F10             = 11;
-    const int PLATFORM_KEY_F11             = 12;
-    const int PLATFORM_KEY_F12             = 13;
-    const int PLATFORM_KEY_UP              = 14;
-    const int PLATFORM_KEY_DOWN            = 15;
-    const int PLATFORM_KEY_LEFT            = 16;
-    const int PLATFORM_KEY_RIGHT           = 17;
-    const int PLATFORM_KEY_LSHIFT          = 18;
-    const int PLATFORM_KEY_RSHIFT          = 19;
-    const int PLATFORM_KEY_LCTRL           = 20;
-    const int PLATFORM_KEY_RCTRL           = 21;
-    const int PLATFORM_KEY_LALT            = 22;
-    const int PLATFORM_KEY_RALT            = 23;
-    const int PLATFORM_KEY_TAB             = 24;
-    const int PLATFORM_KEY_ENTER           = 25;
-    const int PLATFORM_KEY_BACKSPACE       = 26;
-    const int PLATFORM_KEY_INSERT          = 27;
-    const int PLATFORM_KEY_DEL             = 28;
-    const int PLATFORM_KEY_PAGEUP          = 29;
-    const int PLATFORM_KEY_PAGEDOWN        = 30;
-    const int PLATFORM_KEY_HOME            = 31;
-    const int PLATFORM_KEY_END             = 32;
-    const int PLATFORM_KEY_KP_0            = 33;
-    const int PLATFORM_KEY_KP_1            = 34;
-    const int PLATFORM_KEY_KP_2            = 35;
-    const int PLATFORM_KEY_KP_3            = 36;
-    const int PLATFORM_KEY_KP_4            = 37;
-    const int PLATFORM_KEY_KP_5            = 38;
-    const int PLATFORM_KEY_KP_6            = 39;
-    const int PLATFORM_KEY_KP_7            = 40;
-    const int PLATFORM_KEY_KP_8            = 41;
-    const int PLATFORM_KEY_KP_9            = 42;
-    const int PLATFORM_KEY_KP_DIVIDE       = 43;
-    const int PLATFORM_KEY_KP_MULTIPLY     = 44;
-    const int PLATFORM_KEY_KP_SUBTRACT     = 45;
-    const int PLATFORM_KEY_KP_ADD          = 46;
-    const int PLATFORM_KEY_KP_DECIMAL      = 47;
-    const int PLATFORM_KEY_KP_EQUAL        = 48;
-    const int PLATFORM_KEY_KP_ENTER        = 49;
-    const int PLATFORM_KEY_KP_NUM_LOCK     = 50;
-    const int PLATFORM_KEY_CAPS_LOCK       = 51;
-    const int PLATFORM_KEY_SCROLL_LOCK     = 52;
-    const int PLATFORM_KEY_PAUSE           = 53;
-    const int PLATFORM_KEY_LSUPER          = 54;
-    const int PLATFORM_KEY_RSUPER          = 55;
-    const int PLATFORM_KEY_MENU            = 56;
-    const int PLATFORM_KEY_BACK            = 57;
+    const int PLATFORM_KEY_ESC             = 256 + 1;
+    const int PLATFORM_KEY_F1              = 256 + 2;
+    const int PLATFORM_KEY_F2              = 256 + 3;
+    const int PLATFORM_KEY_F3              = 256 + 4;
+    const int PLATFORM_KEY_F4              = 256 + 5;
+    const int PLATFORM_KEY_F5              = 256 + 6;
+    const int PLATFORM_KEY_F6              = 256 + 7;
+    const int PLATFORM_KEY_F7              = 256 + 8;
+    const int PLATFORM_KEY_F8              = 256 + 9;
+    const int PLATFORM_KEY_F9              = 256 + 10;
+    const int PLATFORM_KEY_F10             = 256 + 11;
+    const int PLATFORM_KEY_F11             = 256 + 12;
+    const int PLATFORM_KEY_F12             = 256 + 13;
+    const int PLATFORM_KEY_UP              = 256 + 14;
+    const int PLATFORM_KEY_DOWN            = 256 + 15;
+    const int PLATFORM_KEY_LEFT            = 256 + 16;
+    const int PLATFORM_KEY_RIGHT           = 256 + 17;
+    const int PLATFORM_KEY_LSHIFT          = 256 + 18;
+    const int PLATFORM_KEY_RSHIFT          = 256 + 19;
+    const int PLATFORM_KEY_LCTRL           = 256 + 20;
+    const int PLATFORM_KEY_RCTRL           = 256 + 21;
+    const int PLATFORM_KEY_LALT            = 256 + 22;
+    const int PLATFORM_KEY_RALT            = 256 + 23;
+    const int PLATFORM_KEY_TAB             = 256 + 24;
+    const int PLATFORM_KEY_ENTER           = 256 + 25;
+    const int PLATFORM_KEY_BACKSPACE       = 256 + 26;
+    const int PLATFORM_KEY_INSERT          = 256 + 27;
+    const int PLATFORM_KEY_DEL             = 256 + 28;
+    const int PLATFORM_KEY_PAGEUP          = 256 + 29;
+    const int PLATFORM_KEY_PAGEDOWN        = 256 + 30;
+    const int PLATFORM_KEY_HOME            = 256 + 31;
+    const int PLATFORM_KEY_END             = 256 + 32;
+    const int PLATFORM_KEY_KP_0            = 256 + 33;
+    const int PLATFORM_KEY_KP_1            = 256 + 34;
+    const int PLATFORM_KEY_KP_2            = 256 + 35;
+    const int PLATFORM_KEY_KP_3            = 256 + 36;
+    const int PLATFORM_KEY_KP_4            = 256 + 37;
+    const int PLATFORM_KEY_KP_5            = 256 + 38;
+    const int PLATFORM_KEY_KP_6            = 256 + 39;
+    const int PLATFORM_KEY_KP_7            = 256 + 40;
+    const int PLATFORM_KEY_KP_8            = 256 + 41;
+    const int PLATFORM_KEY_KP_9            = 256 + 42;
+    const int PLATFORM_KEY_KP_DIVIDE       = 256 + 43;
+    const int PLATFORM_KEY_KP_MULTIPLY     = 256 + 44;
+    const int PLATFORM_KEY_KP_SUBTRACT     = 256 + 45;
+    const int PLATFORM_KEY_KP_ADD          = 256 + 46;
+    const int PLATFORM_KEY_KP_DECIMAL      = 256 + 47;
+    const int PLATFORM_KEY_KP_EQUAL        = 256 + 48;
+    const int PLATFORM_KEY_KP_ENTER        = 256 + 49;
+    const int PLATFORM_KEY_KP_NUM_LOCK     = 256 + 50;
+    const int PLATFORM_KEY_CAPS_LOCK       = 256 + 51;
+    const int PLATFORM_KEY_SCROLL_LOCK     = 256 + 52;
+    const int PLATFORM_KEY_PAUSE           = 256 + 53;
+    const int PLATFORM_KEY_LSUPER          = 256 + 54;
+    const int PLATFORM_KEY_RSUPER          = 256 + 55;
+    const int PLATFORM_KEY_MENU            = 256 + 56;
+    const int PLATFORM_KEY_BACK            = 256 + 57;
 
     const int PLATFORM_MOUSE_BUTTON_LEFT   = 0;
     const int PLATFORM_MOUSE_BUTTON_RIGHT  = 1;
