@@ -110,6 +110,15 @@ namespace dmPlatform
     // Registered once by the cart shim, before the engine is created.
     void WasmcartSetInputState(const WasmcartInputState* state);
 
+    // The resolution the host presents the cart at (its preferred size, which
+    // the cart reports back in wc_info_t), set by the cart shim before the
+    // engine is created. The window opens at it instead of game.project's
+    // display size, so the engine draws at the size of the host's canvas:
+    // otherwise WebGPU reconfigures the canvas to the display size every
+    // frame while the host sizes it back, and GL draws a cropped picture.
+    // 0 x 0 (the default) keeps the display size.
+    void WasmcartSetWindowSize(uint32_t width, uint32_t height);
+
     // Reads one host pad block. Returns false when the cart did not request
     // pad input or the index is out of range, which reads as "not connected"
     // rather than as an error. The HID gamepad driver polls through here for

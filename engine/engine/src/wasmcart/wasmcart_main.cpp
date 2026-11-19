@@ -284,6 +284,9 @@ void wc_init(void)
     {
         g_Info.width  = g_HostInfo.preferred_width;
         g_Info.height = g_HostInfo.preferred_height;
+        // and draw at it: the window would otherwise open at game.project's
+        // display size, which the host's canvas is not
+        dmPlatform::WasmcartSetWindowSize(g_Info.width, g_Info.height);
     }
     wasmcart_mark_resolution_resolved();
 

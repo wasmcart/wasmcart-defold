@@ -53,6 +53,16 @@ namespace dmPlatform
         g_Input = state;
     }
 
+    // The host's presentation size (WasmcartSetWindowSize); 0 x 0 = none.
+    static uint32_t g_HostWidth  = 0;
+    static uint32_t g_HostHeight = 0;
+
+    void WasmcartSetWindowSize(uint32_t width, uint32_t height)
+    {
+        g_HostWidth  = width;
+        g_HostHeight = height;
+    }
+
     HWindow NewWindow()
     {
         dmWindow* wnd = new dmWindow();
@@ -76,6 +86,11 @@ namespace dmPlatform
         window->m_WindowOpened = 1;
         window->m_WindowWidth  = params.m_Width;
         window->m_WindowHeight = params.m_Height;
+        if (g_HostWidth && g_HostHeight)
+        {
+            window->m_WindowWidth  = g_HostWidth;
+            window->m_WindowHeight = g_HostHeight;
+        }
 
         return WINDOW_RESULT_OK;
     }
