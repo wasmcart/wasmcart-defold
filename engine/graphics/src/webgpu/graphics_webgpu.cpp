@@ -2972,12 +2972,36 @@ static HVertexBuffer WebGPUNewVertexBuffer(HContext _context, uint32_t size, con
     return (HVertexBuffer)buffer;
 }
 
+// Drops a buffer about to be released from the current render pass's binding
+// cache. The cache compares handles, and a buffer created right after a release
+// can get the released one's address back, so a stale entry would match the new
+// buffer and skip the bind: the pass keeps drawing from the old, smaller buffer
+// and the whole command buffer fails validation (a black frame in a browser).
+static void WebGPUForgetBoundBuffer(WebGPUContext* context, WGPUBuffer buffer)
+{
+    if (!context || !buffer)
+        return;
+    WebGPURenderPass& pass = context->m_CurrentRenderPass;
+    for (int i = 0; i < MAX_VERTEX_BUFFERS; ++i)
+    {
+        if (pass.m_VertexBuffers[i] == buffer)
+        {
+            pass.m_VertexBuffers[i]       = NULL;
+            pass.m_VertexBufferOffsets[i] = 0;
+            pass.m_VertexBufferSizes[i]   = 0;
+        }
+    }
+    if (pass.m_IndexBuffer == buffer)
+        pass.m_IndexBuffer = NULL;
+}
+
 static void WebGPUDeleteVertexBuffer(HVertexBuffer buffer)
 {
     TRACE_CALL;
     WebGPUBuffer* gpu_buffer = (WebGPUBuffer*)buffer;
     if (gpu_buffer->m_Buffer)
     {
+        WebGPUForgetBoundBuffer(g_WebGPUContext, gpu_buffer->m_Buffer);
         wgpuBufferRelease(gpu_buffer->m_Buffer);
     }
     delete gpu_buffer;
@@ -2993,6 +3017,7 @@ static void WebGPUSetVertexBufferData(HVertexBuffer buffer, uint32_t size, const
     WebGPUBuffer* gpu_buffer = (WebGPUBuffer*)buffer;
     if (gpu_buffer->m_Buffer && gpu_buffer->m_Base.m_Size < size)
     {
+        WebGPUForgetBoundBuffer(g_WebGPUContext, gpu_buffer->m_Buffer);
         wgpuBufferRelease(gpu_buffer->m_Buffer);
         gpu_buffer->m_Buffer = NULL;
         gpu_buffer->m_Used = gpu_buffer->m_Base.m_Size = 0;
@@ -3043,7 +3068,10 @@ static void WebGPUDeleteIndexBuffer(HIndexBuffer _buffer)
     TRACE_CALL;
     WebGPUBuffer* buffer = (WebGPUBuffer*)_buffer;
     if (buffer->m_Buffer)
+    {
+        WebGPUForgetBoundBuffer(g_WebGPUContext, buffer->m_Buffer);
         wgpuBufferRelease(buffer->m_Buffer);
+    }
     delete buffer;
 }
 
@@ -3056,6 +3084,7 @@ static void WebGPUSetIndexBufferData(HIndexBuffer _buffer, uint32_t size, const 
     WebGPUBuffer* buffer = (WebGPUBuffer*)_buffer;
     if (buffer->m_Buffer && buffer->m_Base.m_Size < size)
     {
+        WebGPUForgetBoundBuffer(g_WebGPUContext, buffer->m_Buffer);
         wgpuBufferRelease(buffer->m_Buffer);
         buffer->m_Buffer = NULL;
         buffer->m_Used = buffer->m_Base.m_Size = 0;
@@ -3625,13 +3654,19 @@ static void WebGPUSetupRenderPipeline(WebGPUContext* context, WebGPUBuffer* inde
         if (!vertex_buffer || !declaration || !declaration->m_StreamCount)
             continue;
 
+        // The bound range is the buffer's used size, which grows when new data
+        // is written without reallocating: a draw past the range bound earlier
+        // in this pass fails validation, so a change of size rebinds too.
+        assert(buffer_offset <= vertex_buffer->m_Used);
+        const uint64_t bound_size = vertex_buffer->m_Used - buffer_offset;
         if (vertex_buffer->m_Buffer != context->m_CurrentRenderPass.m_VertexBuffers[binding] ||
-            buffer_offset != context->m_CurrentRenderPass.m_VertexBufferOffsets[binding])
+            buffer_offset != context->m_CurrentRenderPass.m_VertexBufferOffsets[binding] ||
+            bound_size != context->m_CurrentRenderPass.m_VertexBufferSizes[binding])
         {
-            assert(buffer_offset <= vertex_buffer->m_Used);
-            wgpuRenderPassEncoderSetVertexBuffer(context->m_CurrentRenderPass.m_Encoder, binding, vertex_buffer->m_Buffer, buffer_offset, vertex_buffer->m_Used - buffer_offset);
+            wgpuRenderPassEncoderSetVertexBuffer(context->m_CurrentRenderPass.m_Encoder, binding, vertex_buffer->m_Buffer, buffer_offset, bound_size);
             context->m_CurrentRenderPass.m_VertexBuffers[binding]       = vertex_buffer->m_Buffer;
             context->m_CurrentRenderPass.m_VertexBufferOffsets[binding] = buffer_offset;
+            context->m_CurrentRenderPass.m_VertexBufferSizes[binding]   = bound_size;
             vertex_buffer->m_LastRenderPass = context->m_RenderPasses;
         }
         ++binding;
@@ -3653,6 +3688,7 @@ static void WebGPUSetupRenderPipeline(WebGPUContext* context, WebGPUBuffer* inde
             wgpuRenderPassEncoderSetVertexBuffer(context->m_CurrentRenderPass.m_Encoder, binding, constant, 0, DEFAULT_VERTEX_ATTRIBUTE_BUFFER_SIZE);
             context->m_CurrentRenderPass.m_VertexBuffers[binding]       = constant;
             context->m_CurrentRenderPass.m_VertexBufferOffsets[binding] = 0;
+            context->m_CurrentRenderPass.m_VertexBufferSizes[binding]   = DEFAULT_VERTEX_ATTRIBUTE_BUFFER_SIZE;
         }
     }
 

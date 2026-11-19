@@ -192,6 +192,7 @@ namespace dmGraphics
         WGPUBindGroup         m_BindGroups[MAX_SET_COUNT];
         WGPUBuffer            m_VertexBuffers[MAX_VERTEX_BUFFERS];
         uint64_t              m_VertexBufferOffsets[MAX_VERTEX_BUFFERS];
+        uint64_t              m_VertexBufferSizes[MAX_VERTEX_BUFFERS];
         WebGPURenderTarget*   m_Target;
         WGPURenderPassEncoder m_Encoder;
         WGPURenderPipeline    m_Pipeline;
